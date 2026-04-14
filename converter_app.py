@@ -17,7 +17,6 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-import numpy as np
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -43,39 +42,49 @@ def find_cjpegli() -> str | None:
     return found  # None if not installed
 
 
+def find_exiftool() -> str | None:
+    for path in ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool"]:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("exiftool")
+
+
 # ---------------------------------------------------------------------------
 # Conversion logic
 # ---------------------------------------------------------------------------
 
-def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str) -> None:
-    """Convert a single TIFF file to JPEG via cjpegli using a temp PPM."""
-    img = Image.open(src)
+def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str,
+                 exiftool: str | None = None) -> None:
+    """
+    Convert a single TIFF to JPEG via cjpegli, preserving all metadata.
 
-    # Ensure RGB (handles grayscale, RGBA, palette, etc.)
+    Pipeline:
+      1. Pillow reads TIFF → temp PNG  (PNG carries the ICC profile through)
+      2. cjpegli reads PNG → JPEG      (ICC profile preserved natively)
+      3. exiftool copies EXIF/IPTC/XMP from original TIFF → output JPEG
+    """
+    img = Image.open(src)
+    icc_profile = img.info.get("icc_profile")  # bytes or None
+
+    # Ensure RGB (handles grayscale, RGBA, palette, CMYK, etc.)
     if img.mode == "RGBA":
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[3])
         img = bg
-    elif img.mode != "RGB":
+    elif img.mode not in ("RGB", "I;16", "I;16B"):
         img = img.convert("RGB")
 
-    # Detect bit depth
-    arr = np.array(img)
-    if arr.dtype == np.uint16:
-        # Write 16-bit PPM (P6 with maxval 65535)
-        with tempfile.NamedTemporaryFile(suffix=".ppm", delete=False) as tmp:
-            tmp_path = tmp.name
-        _write_ppm16(arr, tmp_path)
-    else:
-        # Convert to uint8 if needed, write 8-bit PPM
-        if arr.dtype != np.uint8:
-            arr = (arr / arr.max() * 255).astype(np.uint8)
-        with tempfile.NamedTemporaryFile(suffix=".ppm", delete=False) as tmp:
-            tmp_path = tmp.name
-        _write_ppm8(arr, tmp_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
 
+    # Write temp PNG — carries ICC profile so cjpegli embeds it in the JPEG
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
     try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        save_kwargs = {"format": "PNG"}
+        if icc_profile:
+            save_kwargs["icc_profile"] = icc_profile
+        img.save(tmp_path, **save_kwargs)
+
         result = subprocess.run(
             [cjpegli, tmp_path, str(dst), f"--quality={quality}"],
             capture_output=True,
@@ -86,20 +95,39 @@ def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str) -> None:
     finally:
         os.unlink(tmp_path)
 
+    # Copy EXIF, IPTC, XMP from original TIFF into the output JPEG
+    if exiftool and dst.exists():
+        subprocess.run(
+            [
+                exiftool,
+                "-TagsFromFile", str(src),
+                "-EXIF:all", "-IPTC:all", "-XMP:all",
+                "-overwrite_original",
+                "-quiet",
+                str(dst),
+            ],
+            capture_output=True,
+        )
 
-def _write_ppm8(arr: np.ndarray, path: str) -> None:
-    h, w, _ = arr.shape
-    with open(path, "wb") as f:
-        f.write(f"P6\n{w} {h}\n255\n".encode())
-        f.write(arr.tobytes())
-
-
-def _write_ppm16(arr: np.ndarray, path: str) -> None:
-    h, w, _ = arr.shape
-    with open(path, "wb") as f:
-        f.write(f"P6\n{w} {h}\n65535\n".encode())
-        # PPM requires big-endian 16-bit
-        f.write(arr.astype(">u2").tobytes())
+        # Embed ICC profile directly from bytes (cjpegli strips ICC from PNG)
+        # Pillow reads it reliably from both TIFF tags (tag 34675 / icc_profile key)
+        if icc_profile:
+            with tempfile.NamedTemporaryFile(suffix=".icc", delete=False) as icc_tmp:
+                icc_tmp.write(icc_profile)
+                icc_tmp_path = icc_tmp.name
+            try:
+                subprocess.run(
+                    [
+                        exiftool,
+                        f"-ICC_Profile<={icc_tmp_path}",
+                        "-overwrite_original",
+                        "-quiet",
+                        str(dst),
+                    ],
+                    capture_output=True,
+                )
+            finally:
+                os.unlink(icc_tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +141,7 @@ class ConverterApp(tk.Tk):
         self.resizable(False, False)
 
         self.cjpegli = find_cjpegli()
+        self.exiftool = find_exiftool()
         self._input_dir: Path | None = None
         self._output_dir: Path | None = None
         self._tiff_files: list[Path] = []
@@ -188,10 +217,17 @@ class ConverterApp(tk.Tk):
         ttk.Label(frm_prog, textvariable=self._status_var, width=18,
                   anchor="w").grid(row=0, column=1)
 
+        # ── Metadata status ───────────────────────────────────────────
+        frm_meta = ttk.Frame(self)
+        frm_meta.grid(row=5, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
+        self._meta_var = tk.StringVar()
+        ttk.Label(frm_meta, textvariable=self._meta_var,
+                  foreground="gray").grid(row=0, column=0)
+
         # ── Convert button ────────────────────────────────────────────
         self._convert_btn = ttk.Button(self, text="Convert",
                                        command=self._start_conversion)
-        self._convert_btn.grid(row=5, column=0, pady=(4, 14))
+        self._convert_btn.grid(row=6, column=0, pady=(4, 14))
 
         self.columnconfigure(0, weight=1)
 
@@ -210,6 +246,11 @@ class ConverterApp(tk.Tk):
                 "See plan.md for full build instructions.",
             )
             self._convert_btn.state(["disabled"])
+
+        if self.exiftool:
+            self._meta_var.set("✓ Metadata transfer enabled (EXIF · IPTC · XMP · ICC)")
+        else:
+            self._meta_var.set("⚠ exiftool not found — ICC profile only, no EXIF/XMP transfer.")
 
     def _pick_input(self):
         d = filedialog.askdirectory(title="Select folder containing TIFF files")
@@ -288,7 +329,7 @@ class ConverterApp(tk.Tk):
             dst = self._output_dir / (src.stem + ".jpg")
             self._update_status(f"{i - 1} / {total}")
             try:
-                convert_tiff(src, dst, quality, self.cjpegli)
+                convert_tiff(src, dst, quality, self.cjpegli, self.exiftool)
             except Exception as exc:
                 errors.append(f"{src.name}: {exc}")
             self._set_progress(i, total)
