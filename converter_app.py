@@ -21,6 +21,13 @@ from PIL import Image
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
+RESIZE_MODES = [
+    ("long_edge",  "Long Edge"),
+    ("short_edge", "Short Edge"),
+    ("percentage", "Percentage"),
+    ("wh",         "Width & Height"),
+]
+
 # ---------------------------------------------------------------------------
 # Binary detection
 # ---------------------------------------------------------------------------
@@ -52,12 +59,58 @@ def find_exiftool() -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Resize helper
+# ---------------------------------------------------------------------------
+
+def apply_resize(
+    img: Image.Image,
+    mode: str,
+    value: int,
+    w: int = 3000,
+    h: int = 2000,
+) -> Image.Image:
+    """Return a resized copy of img, or the original if already within bounds."""
+    orig_w, orig_h = img.size
+
+    if mode == "long_edge":
+        long = max(orig_w, orig_h)
+        if long <= value:
+            return img
+        scale = value / long
+        new_size = (round(orig_w * scale), round(orig_h * scale))
+    elif mode == "short_edge":
+        short = min(orig_w, orig_h)
+        if short <= value:
+            return img
+        scale = value / short
+        new_size = (round(orig_w * scale), round(orig_h * scale))
+    elif mode == "percentage":
+        if value >= 100:
+            return img
+        scale = value / 100
+        new_size = (round(orig_w * scale), round(orig_h * scale))
+    else:  # wh
+        if orig_w <= w and orig_h <= h:
+            return img
+        fit = img.copy()
+        fit.thumbnail((w, h), Image.LANCZOS)
+        return fit
+
+    return img.resize(new_size, Image.LANCZOS)
+
+
+# ---------------------------------------------------------------------------
 # Conversion logic
 # ---------------------------------------------------------------------------
 
 def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str,
                  exiftool: str | None = None,
-                 strip_metadata: bool = False) -> None:
+                 strip_metadata: bool = False,
+                 resize_enabled: bool = False,
+                 resize_mode: str = "long_edge",
+                 resize_value: int = 3000,
+                 resize_w: int = 3000,
+                 resize_h: int = 2000) -> None:
     """
     Convert a single TIFF to JPEG via cjpegli, preserving all metadata.
 
@@ -76,6 +129,10 @@ def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str,
         img = bg
     elif img.mode not in ("RGB", "I;16", "I;16B"):
         img = img.convert("RGB")
+
+    # Resize before encode if requested
+    if resize_enabled:
+        img = apply_resize(img, resize_mode, resize_value, resize_w, resize_h)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -148,6 +205,11 @@ class ConverterApp(tk.Tk):
         self._mode = tk.StringVar(value="folder")
         self._mirror_tree = tk.BooleanVar(value=False)
         self._strip_metadata = tk.BooleanVar(value=False)
+        self._resize_enabled = tk.BooleanVar(value=False)
+        self._resize_mode = tk.StringVar(value="long_edge")
+        self._resize_value = tk.StringVar(value="3000")
+        self._resize_w = tk.StringVar(value="3000")
+        self._resize_h = tk.StringVar(value="2000")
         self._input_file: Path | None = None
         self._input_dir: Path | None = None
         self._output_dir: Path | None = None
@@ -227,12 +289,58 @@ class ConverterApp(tk.Tk):
             self._frm_opts,
             text="Strip all metadata",
             variable=self._strip_metadata,
+            command=self._update_metadata_status_visibility,
         )
         self._strip_meta_chk.grid(row=1, column=0, sticky="w")
 
+        # ── Image Sizing ──────────────────────────────────────────────
+        frm_size = ttk.LabelFrame(self, text="Image Sizing")
+        frm_size.grid(row=4, column=0, sticky="ew", padx=PAD_X, pady=4)
+
+        ttk.Checkbutton(
+            frm_size,
+            text="Resize images",
+            variable=self._resize_enabled,
+            command=self._on_resize_toggle,
+        ).grid(row=0, column=0, columnspan=5, sticky="w", padx=8, pady=(6, 2))
+
+        self._resize_row = ttk.Frame(frm_size)
+        self._resize_row.grid(row=1, column=0, sticky="w", padx=8, pady=(0, 6))
+
+        mode_labels = [label for _, label in RESIZE_MODES]
+        self._resize_combo = ttk.Combobox(
+            self._resize_row, values=mode_labels, state="readonly", width=16
+        )
+        self._resize_combo.set("Long Edge")
+        self._resize_combo.grid(row=0, column=0, padx=(0, 8))
+        self._resize_combo.bind("<<ComboboxSelected>>", self._on_resize_mode_change)
+
+        self._resize_val_entry = ttk.Entry(
+            self._resize_row, textvariable=self._resize_value, width=7
+        )
+        self._resize_val_entry.grid(row=0, column=1)
+
+        self._resize_w_entry = ttk.Entry(
+            self._resize_row, textvariable=self._resize_w, width=7
+        )
+        self._resize_w_entry.grid(row=0, column=1)
+
+        ttk.Label(self._resize_row, text="×").grid(row=0, column=2, padx=4)
+
+        self._resize_h_entry = ttk.Entry(
+            self._resize_row, textvariable=self._resize_h, width=7
+        )
+        self._resize_h_entry.grid(row=0, column=3)
+
+        self._resize_unit_lbl = ttk.Label(self._resize_row, text="px", width=3)
+        self._resize_unit_lbl.grid(row=0, column=4, padx=(4, 0))
+
+        # Start hidden; shown when checkbox is ticked
+        self._resize_row.grid_remove()
+
         # ── Quality slider ────────────────────────────────────────────
         frm_q = ttk.LabelFrame(self, text="Quality")
-        frm_q.grid(row=4, column=0, sticky="ew", padx=PAD_X, pady=4)
+        frm_q.grid(row=5, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._quality = tk.IntVar(value=85)
         slider = ttk.Scale(frm_q, from_=1, to=100, orient="horizontal",
@@ -245,7 +353,7 @@ class ConverterApp(tk.Tk):
 
         # ── File list ─────────────────────────────────────────────────
         frm_list = ttk.LabelFrame(self, text="Files found")
-        frm_list.grid(row=5, column=0, sticky="ew", padx=PAD_X, pady=4)
+        frm_list.grid(row=6, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._listbox = tk.Listbox(frm_list, height=8, width=62,
                                    selectmode="browse", font=("Menlo", 11))
@@ -261,7 +369,7 @@ class ConverterApp(tk.Tk):
 
         # ── Progress ──────────────────────────────────────────────────
         frm_prog = ttk.Frame(self)
-        frm_prog.grid(row=6, column=0, sticky="ew", padx=PAD_X, pady=4)
+        frm_prog.grid(row=7, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._progress = ttk.Progressbar(frm_prog, length=400, mode="determinate")
         self._progress.grid(row=0, column=0, padx=(0, 10))
@@ -271,19 +379,20 @@ class ConverterApp(tk.Tk):
                   anchor="w").grid(row=0, column=1)
 
         # ── Metadata status ───────────────────────────────────────────
-        frm_meta = ttk.Frame(self)
-        frm_meta.grid(row=7, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
+        self._frm_meta = ttk.Frame(self)
+        self._frm_meta.grid(row=8, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
         self._meta_var = tk.StringVar()
-        ttk.Label(frm_meta, textvariable=self._meta_var,
+        ttk.Label(self._frm_meta, textvariable=self._meta_var,
                   foreground="gray").grid(row=0, column=0)
 
         # ── Convert button ────────────────────────────────────────────
         self._convert_btn = ttk.Button(self, text="Convert",
                                        command=self._start_conversion)
-        self._convert_btn.grid(row=8, column=0, pady=(4, 14))
+        self._convert_btn.grid(row=9, column=0, pady=(4, 14))
 
         self.columnconfigure(0, weight=1)
         self._on_mode_change()
+        self._update_metadata_status_visibility()
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -305,6 +414,38 @@ class ConverterApp(tk.Tk):
             self._meta_var.set("✓ Metadata transfer enabled (EXIF · IPTC · XMP · ICC)")
         else:
             self._meta_var.set("⚠ exiftool not found — ICC profile only, no EXIF/XMP transfer.")
+
+        self._update_metadata_status_visibility()
+
+    def _on_resize_toggle(self):
+        if self._resize_enabled.get():
+            self._resize_row.grid()
+            self._on_resize_mode_change()
+        else:
+            self._resize_row.grid_remove()
+
+    def _on_resize_mode_change(self, _event=None):
+        label = self._resize_combo.get()
+        mode = next((k for k, v in RESIZE_MODES if v == label), "long_edge")
+        self._resize_mode.set(mode)
+        if mode == "wh":
+            self._resize_val_entry.grid_remove()
+            self._resize_w_entry.grid()
+            self._resize_unit_lbl.config(text="px")
+        elif mode == "percentage":
+            self._resize_w_entry.grid_remove()
+            self._resize_val_entry.grid()
+            self._resize_unit_lbl.config(text="%")
+        else:
+            self._resize_w_entry.grid_remove()
+            self._resize_val_entry.grid()
+            self._resize_unit_lbl.config(text="px")
+
+    def _update_metadata_status_visibility(self):
+        if self._strip_metadata.get():
+            self._frm_meta.grid_remove()
+        else:
+            self._frm_meta.grid()
 
     def _on_mode_change(self):
         mode = self._mode.get()
@@ -430,6 +571,30 @@ class ConverterApp(tk.Tk):
         desc = next((v for k, v in labels.items() if q in k), "")
         return f"Quality: {q} / 100  —  {desc}"
 
+    def _parse_resize_params(self) -> tuple[bool, str, int, int, int]:
+        """Validate and return (enabled, mode, value, w, h). Raises ValueError on bad input."""
+        if not self._resize_enabled.get():
+            return False, "", 0, 0, 0
+        mode = self._resize_mode.get()
+        try:
+            if mode == "wh":
+                w = int(self._resize_w.get())
+                h = int(self._resize_h.get())
+                if w <= 0 or h <= 0:
+                    raise ValueError
+                return True, mode, 0, w, h
+            else:
+                val = int(self._resize_value.get())
+                if val <= 0:
+                    raise ValueError
+                if mode == "percentage" and val >= 100:
+                    raise ValueError("Percentage must be less than 100.")
+                return True, mode, val, 0, 0
+        except ValueError as exc:
+            label = next((v for k, v in RESIZE_MODES if k == mode), mode)
+            detail = str(exc) if str(exc) else "Enter a valid positive number."
+            raise ValueError(f"Image Sizing — {label}: {detail}") from None
+
     def _start_conversion(self):
         if self._running:
             return
@@ -445,6 +610,12 @@ class ConverterApp(tk.Tk):
             messagebox.showwarning("No output", "Please choose an output folder for mirrored output.")
             return
 
+        try:
+            self._parse_resize_params()
+        except ValueError as exc:
+            messagebox.showwarning("Invalid resize setting", str(exc))
+            return
+
         self._running = True
         self._convert_btn.state(["disabled"])
         threading.Thread(target=self._run_conversion, daemon=True).start()
@@ -454,6 +625,7 @@ class ConverterApp(tk.Tk):
         total = len(files)
         quality = int(self._quality.get())
         errors: list[str] = []
+        resize_enabled, resize_mode, resize_value, resize_w, resize_h = self._parse_resize_params()
 
         self._set_progress(0, total)
 
@@ -468,6 +640,11 @@ class ConverterApp(tk.Tk):
                     self.cjpegli,
                     self.exiftool,
                     strip_metadata=self._strip_metadata.get(),
+                    resize_enabled=resize_enabled,
+                    resize_mode=resize_mode,
+                    resize_value=resize_value,
+                    resize_w=resize_w,
+                    resize_h=resize_h,
                 )
             except Exception as exc:
                 errors.append(f"{src.name}: {exc}")
