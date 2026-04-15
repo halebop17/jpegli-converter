@@ -85,7 +85,7 @@ def apply_resize(
         scale = value / short
         new_size = (round(orig_w * scale), round(orig_h * scale))
     elif mode == "percentage":
-        if value >= 100:
+        if value == 100:
             return img
         scale = value / 100
         new_size = (round(orig_w * scale), round(orig_h * scale))
@@ -208,6 +208,7 @@ class ConverterApp(tk.Tk):
         self._resize_enabled = tk.BooleanVar(value=False)
         self._resize_mode = tk.StringVar(value="long_edge")
         self._resize_value = tk.StringVar(value="3000")
+        self._percentage_default_set = False
         self._resize_w = tk.StringVar(value="3000")
         self._resize_h = tk.StringVar(value="2000")
         self._input_file: Path | None = None
@@ -436,6 +437,9 @@ class ConverterApp(tk.Tk):
             self._resize_h_entry.grid()
             self._resize_unit_lbl.config(text="px")
         elif mode == "percentage":
+            if not self._percentage_default_set:
+                self._resize_value.set("100")
+                self._percentage_default_set = True
             self._resize_w_entry.grid_remove()
             self._resize_mul_lbl.grid_remove()
             self._resize_h_entry.grid_remove()
@@ -594,8 +598,6 @@ class ConverterApp(tk.Tk):
                 val = int(self._resize_value.get())
                 if val <= 0:
                     raise ValueError
-                if mode == "percentage" and val > 100:
-                    raise ValueError("Percentage must be 100 or less.")
                 return True, mode, val, 0, 0
         except ValueError as exc:
             label = next((v for k, v in RESIZE_MODES if k == mode), mode)
