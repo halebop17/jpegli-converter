@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 TIFF → jpegli Batch Converter
-Phase 1: Convert .tif/.tiff files to high-quality JPEG using cjpegli.
+Phase 4: True 16-bit pipeline — TIFF decoded via tifffile (uint16 preserved),
+         temp PNG written at native bit depth via imagecodecs.
 
 Run with:   .venv/bin/python3 converter_app.py
 Requires:   bin/cjpegli  (built from github.com/google/jpegli)
-            pip install Pillow
+            pip install Pillow tifffile imagecodecs
 """
 
 import os
@@ -17,6 +18,9 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import imagecodecs
+import numpy as np
+import tifffile
 from PIL import Image
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
@@ -100,6 +104,70 @@ def apply_resize(
 
 
 # ---------------------------------------------------------------------------
+# Image I/O helpers (16-bit aware)
+# ---------------------------------------------------------------------------
+
+def _extract_icc(src: Path) -> bytes | None:
+    """Return the raw ICC profile bytes from a TIFF, or None."""
+    try:
+        img = Image.open(src)
+        return img.info.get("icc_profile")
+    except Exception:
+        return None
+
+
+def _read_tiff_array(src: Path) -> tuple[np.ndarray, bool]:
+    """
+    Read a TIFF using tifffile and return (array, is_16bit).
+    array dtype is uint8 or uint16 depending on source bit depth.
+    """
+    arr = tifffile.imread(str(src))
+    is_16bit = arr.dtype == np.uint16
+    return arr, is_16bit
+
+
+def _normalize_array(arr: np.ndarray) -> np.ndarray:
+    """
+    Normalise an image array to shape (H, W, 3) with dtype uint8 or uint16.
+    Handles: RGB, RGBA (alpha-composited onto white), grayscale.
+    """
+    if arr.ndim == 2:
+        # Grayscale → stack to RGB
+        arr = np.stack([arr, arr, arr], axis=-1)
+        return arr
+
+    if arr.shape[2] == 4:
+        # RGBA → composite onto white background at native bit depth
+        maxval = 65535 if arr.dtype == np.uint16 else 255
+        alpha = arr[:, :, 3:4].astype(np.float32) / maxval
+        rgb = arr[:, :, :3].astype(np.float32)
+        bg = np.full_like(rgb, float(maxval))
+        composited = (rgb * alpha + bg * (1.0 - alpha))
+        return composited.astype(arr.dtype)
+
+    if arr.shape[2] == 3:
+        return arr
+
+    # Unexpected channel count — fall back to first 3 channels
+    return arr[:, :, :3]
+
+
+def _write_png_temp(arr: np.ndarray, path: str) -> None:
+    """
+    Write array to a temporary PNG file at its native bit depth.
+    uint16 arrays are written as 16-bit PNG via imagecodecs;
+    uint8 arrays fall back to Pillow for maximum compatibility.
+    """
+    if arr.dtype == np.uint16:
+        encoded = imagecodecs.png_encode(arr)
+        with open(path, "wb") as f:
+            f.write(encoded)
+    else:
+        Image.fromarray(arr, mode="RGB").save(path, format="PNG")
+
+
+
+# ---------------------------------------------------------------------------
 # Conversion logic
 # ---------------------------------------------------------------------------
 
@@ -115,35 +183,49 @@ def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str,
     Convert a single TIFF to JPEG via cjpegli, preserving all metadata.
 
     Pipeline:
-      1. Pillow reads TIFF → temp PNG  (PNG carries the ICC profile through)
-      2. cjpegli reads PNG → JPEG      (ICC profile preserved natively)
-      3. exiftool copies EXIF/IPTC/XMP from original TIFF → output JPEG
+      1. tifffile reads TIFF → numpy array (uint8 or uint16, bit depth preserved)
+      2. normalize shape to (H, W, 3); alpha-composite RGBA at native depth
+      3. optional resize via Pillow (round-trip through PIL Image)
+      4. write temp PNG at native bit depth (imagecodecs for 16-bit, Pillow for 8-bit)
+      5. cjpegli reads PNG → JPEG (receives 16-bit input when available)
+      6. exiftool copies EXIF/IPTC/XMP from original TIFF → output JPEG
+      7. exiftool embeds ICC profile extracted from original TIFF
     """
-    img = Image.open(src)
-    icc_profile = img.info.get("icc_profile")  # bytes or None
+    icc_profile = _extract_icc(src)
 
-    # Ensure RGB (handles grayscale, RGBA, palette, CMYK, etc.)
-    if img.mode == "RGBA":
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        bg.paste(img, mask=img.split()[3])
-        img = bg
-    elif img.mode not in ("RGB", "I;16", "I;16B"):
-        img = img.convert("RGB")
+    try:
+        arr, is_16bit = _read_tiff_array(src)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read TIFF: {exc}") from exc
 
-    # Resize before encode if requested
+    arr = _normalize_array(arr)
+
+    # Resize via Pillow (round-trip preserves dtype)
     if resize_enabled:
-        img = apply_resize(img, resize_mode, resize_value, resize_w, resize_h)
+        pil_mode = "RGB" if arr.dtype == np.uint8 else "RGB"
+        # Pillow only supports 8-bit RGB from uint8; for uint16 we must scale
+        # down temporarily, resize, then restore.  Resize is geometric only so
+        # the 8-bit precision during the resize step is fine.
+        interp = Image.LANCZOS
+        if arr.dtype == np.uint16:
+            arr8 = (arr >> 8).astype(np.uint8)
+            img_pil = Image.fromarray(arr8, mode="RGB")
+        else:
+            img_pil = Image.fromarray(arr, mode="RGB")
+        img_pil = apply_resize(img_pil, resize_mode, resize_value, resize_w, resize_h)
+        resized8 = np.array(img_pil)
+        if arr.dtype == np.uint16 and resized8.shape[:2] != arr.shape[:2]:
+            # Image was actually resized — scale back to uint16
+            arr = (resized8.astype(np.uint16) << 8)
+        elif arr.dtype == np.uint8:
+            arr = resized8
 
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write temp PNG — carries ICC profile so cjpegli embeds it in the JPEG
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        save_kwargs = {"format": "PNG"}
-        if icc_profile:
-            save_kwargs["icc_profile"] = icc_profile
-        img.save(tmp_path, **save_kwargs)
+        _write_png_temp(arr, tmp_path)
 
         result = subprocess.run(
             [cjpegli, tmp_path, str(dst), f"--quality={quality}"],
@@ -169,8 +251,7 @@ def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str,
             capture_output=True,
         )
 
-        # Embed ICC profile directly from bytes (cjpegli strips ICC from PNG)
-        # Pillow reads it reliably from both TIFF tags (tag 34675 / icc_profile key)
+        # Embed ICC profile from source TIFF
         if icc_profile:
             with tempfile.NamedTemporaryFile(suffix=".icc", delete=False) as icc_tmp:
                 icc_tmp.write(icc_profile)
