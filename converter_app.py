@@ -336,7 +336,6 @@ class ConverterApp(tk.Tk):
 
         # ── Input picker ──────────────────────────────────────────────
         self._frm_in = ttk.LabelFrame(self, text="Input folder (TIFF files)")
-        self._frm_in.grid(row=1, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._in_var = tk.StringVar(value="(no folder selected)")
         ttk.Label(self._frm_in, textvariable=self._in_var, width=52,
@@ -347,7 +346,6 @@ class ConverterApp(tk.Tk):
 
         # ── Output folder ─────────────────────────────────────────────
         self._frm_out = ttk.LabelFrame(self, text="Output folder")
-        self._frm_out.grid(row=2, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._out_var = tk.StringVar(value="(same as input / converted)")
         ttk.Label(self._frm_out, textvariable=self._out_var, width=52,
@@ -355,38 +353,40 @@ class ConverterApp(tk.Tk):
         ttk.Button(self._frm_out, text="Browse…",
                    command=self._pick_output).grid(row=0, column=1, padx=(0, 8))
 
-        # ── Options ───────────────────────────────────────────────────
-        self._frm_opts = ttk.Frame(self)
-        self._frm_opts.grid(row=3, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
+        # ── Quality slider ────────────────────────────────────────────
+        self._frm_q = ttk.LabelFrame(self, text="Quality")
+
+        self._quality = tk.IntVar(value=85)
+        slider = ttk.Scale(self._frm_q, from_=1, to=100, orient="horizontal",
+                           variable=self._quality, length=340,
+                           command=self._update_quality_label)
+        slider.grid(row=0, column=0, padx=10, pady=(6, 2))
+
+        self._q_label = ttk.Label(self._frm_q, text=self._quality_label_text(), width=32)
+        self._q_label.grid(row=1, column=0, padx=10, pady=(0, 6))
+
+        # ── Folder structure options ─────────────────────────────────
+        self._frm_structure = ttk.LabelFrame(self, text="Folder structure")
 
         self._mirror_chk = ttk.Checkbutton(
-            self._frm_opts,
+            self._frm_structure,
             text="Mirror folder structure to output folder",
             variable=self._mirror_tree,
             command=self._scan_files,
         )
-        self._mirror_chk.grid(row=0, column=0, sticky="w", pady=(0, 2))
-
-        self._strip_meta_chk = ttk.Checkbutton(
-            self._frm_opts,
-            text="Strip all metadata",
-            variable=self._strip_metadata,
-            command=self._update_metadata_status_visibility,
-        )
-        self._strip_meta_chk.grid(row=1, column=0, sticky="w")
+        self._mirror_chk.grid(row=0, column=0, sticky="w", padx=8, pady=6)
 
         # ── Image Sizing ──────────────────────────────────────────────
-        frm_size = ttk.LabelFrame(self, text="Image Sizing")
-        frm_size.grid(row=4, column=0, sticky="ew", padx=PAD_X, pady=4)
+        self._frm_size = ttk.LabelFrame(self, text="Image Sizing")
 
         ttk.Checkbutton(
-            frm_size,
+            self._frm_size,
             text="Resize images",
             variable=self._resize_enabled,
             command=self._on_resize_toggle,
         ).grid(row=0, column=0, columnspan=5, sticky="w", padx=8, pady=(6, 2))
 
-        self._resize_row = ttk.Frame(frm_size)
+        self._resize_row = ttk.Frame(self._frm_size)
         self._resize_row.grid(row=1, column=0, sticky="w", padx=8, pady=(0, 6))
 
         mode_labels = [label for _, label in RESIZE_MODES]
@@ -407,7 +407,7 @@ class ConverterApp(tk.Tk):
         )
         self._resize_w_entry.grid(row=0, column=1)
 
-        self._resize_mul_lbl = ttk.Label(self._resize_row, text="×")
+        self._resize_mul_lbl = ttk.Label(self._resize_row, text="x")
         self._resize_mul_lbl.grid(row=0, column=2, padx=4)
 
         self._resize_h_entry = ttk.Entry(
@@ -421,44 +421,40 @@ class ConverterApp(tk.Tk):
         # Start hidden; shown when checkbox is ticked
         self._resize_row.grid_remove()
 
-        # ── Quality slider ────────────────────────────────────────────
-        frm_q = ttk.LabelFrame(self, text="Quality")
-        frm_q.grid(row=5, column=0, sticky="ew", padx=PAD_X, pady=4)
+        # ── Metadata options ─────────────────────────────────────────
+        self._frm_metadata = ttk.LabelFrame(self, text="Metadata")
 
-        self._quality = tk.IntVar(value=85)
-        slider = ttk.Scale(frm_q, from_=1, to=100, orient="horizontal",
-                           variable=self._quality, length=340,
-                           command=self._update_quality_label)
-        slider.grid(row=0, column=0, padx=10, pady=(6, 2))
-
-        self._q_label = ttk.Label(frm_q, text=self._quality_label_text(), width=32)
-        self._q_label.grid(row=1, column=0, padx=10, pady=(0, 6))
+        self._strip_meta_chk = ttk.Checkbutton(
+            self._frm_metadata,
+            text="Strip all metadata",
+            variable=self._strip_metadata,
+            command=self._update_metadata_status_visibility,
+        )
+        self._strip_meta_chk.grid(row=0, column=0, sticky="w", padx=8, pady=6)
 
         # ── File list ─────────────────────────────────────────────────
-        frm_list = ttk.LabelFrame(self, text="Files found")
-        frm_list.grid(row=6, column=0, sticky="ew", padx=PAD_X, pady=4)
+        self._frm_list = ttk.LabelFrame(self, text="Files found")
 
-        self._listbox = tk.Listbox(frm_list, height=8, width=62,
+        self._listbox = tk.Listbox(self._frm_list, height=8, width=62,
                                    selectmode="browse", font=("Menlo", 11))
-        scrollbar = ttk.Scrollbar(frm_list, orient="vertical",
+        scrollbar = ttk.Scrollbar(self._frm_list, orient="vertical",
                                   command=self._listbox.yview)
         self._listbox.configure(yscrollcommand=scrollbar.set)
         self._listbox.grid(row=0, column=0, padx=(8, 0), pady=6)
         scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=6)
 
-        self._count_label = ttk.Label(frm_list, text="No files selected.")
+        self._count_label = ttk.Label(self._frm_list, text="No files selected.")
         self._count_label.grid(row=1, column=0, columnspan=2,
                                 padx=8, pady=(0, 6), sticky="w")
 
         # ── Progress ──────────────────────────────────────────────────
-        frm_prog = ttk.Frame(self)
-        frm_prog.grid(row=7, column=0, sticky="ew", padx=PAD_X, pady=4)
+        self._frm_prog = ttk.Frame(self)
 
-        self._progress = ttk.Progressbar(frm_prog, length=400, mode="determinate")
+        self._progress = ttk.Progressbar(self._frm_prog, length=400, mode="determinate")
         self._progress.grid(row=0, column=0, padx=(0, 10))
 
         self._status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frm_prog, textvariable=self._status_var, width=18,
+        ttk.Label(self._frm_prog, textvariable=self._status_var, width=18,
                   anchor="w").grid(row=0, column=1)
 
         # ── Metadata status ───────────────────────────────────────────
@@ -471,11 +467,51 @@ class ConverterApp(tk.Tk):
         # ── Convert button ────────────────────────────────────────────
         self._convert_btn = ttk.Button(self, text="Convert",
                                        command=self._start_conversion)
-        self._convert_btn.grid(row=9, column=0, pady=(4, 14))
 
         self.columnconfigure(0, weight=1)
         self._on_mode_change()
         self._update_metadata_status_visibility()
+
+    def _apply_mode_layout(self):
+        PAD_X = 12
+        mode = self._mode.get()
+
+        row = 1
+
+        self._frm_in.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+        row += 1
+
+        if mode == "file":
+            self._frm_out.grid_remove()
+        else:
+            self._frm_out.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+            row += 1
+
+        self._frm_q.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+        row += 1
+
+        if mode == "tree":
+            self._frm_structure.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+            row += 1
+        else:
+            self._frm_structure.grid_remove()
+
+        self._frm_size.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+        row += 1
+
+        self._frm_metadata.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+        row += 1
+
+        self._frm_list.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+        row += 1
+
+        self._frm_prog.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+        row += 1
+
+        self._frm_meta.grid(row=row, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
+        row += 1
+
+        self._convert_btn.grid(row=row, column=0, pady=(4, 14))
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -545,21 +581,22 @@ class ConverterApp(tk.Tk):
         if mode == "file":
             self._frm_in.config(text="Input TIFF file")
             self._in_var.set(str(self._input_file) if self._input_file else "(no file selected)")
-            self._frm_out.grid_remove()
             self._mirror_tree.set(False)
-            self._mirror_chk.grid_remove()
+            if self._output_dir is None:
+                self._out_var.set("(same as input / converted)")
         elif mode == "folder":
             self._frm_in.config(text="Input folder (TIFF files)")
             self._in_var.set(str(self._input_dir) if self._input_dir else "(no folder selected)")
-            self._frm_out.grid()
             self._mirror_tree.set(False)
-            self._mirror_chk.grid_remove()
+            if self._output_dir is None:
+                self._out_var.set("(same as input / converted)")
         else:
             self._frm_in.config(text="Input root folder (recursive TIFF scan)")
             self._in_var.set(str(self._input_dir) if self._input_dir else "(no folder selected)")
-            self._frm_out.grid()
-            self._mirror_chk.grid()
+            if self._output_dir is None:
+                self._out_var.set("(same as input folders in /converted)")
 
+        self._apply_mode_layout()
         self._scan_files()
 
     def _pick_input(self):
@@ -583,10 +620,12 @@ class ConverterApp(tk.Tk):
         self._input_file = None
         self._in_var.set(str(self._input_dir))
 
-        if self._output_dir is None:
+        if self._output_dir is None and self._mode.get() == "folder":
             default_out = self._input_dir / "converted"
             self._output_dir = default_out
             self._out_var.set(str(default_out))
+        elif self._output_dir is None and self._mode.get() == "tree":
+            self._out_var.set("(same as input folders in /converted)")
 
         self._scan_files()
 
