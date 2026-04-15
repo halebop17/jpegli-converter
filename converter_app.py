@@ -5,7 +5,7 @@ Phase 1: Convert .tif/.tiff files to high-quality JPEG using cjpegli.
 
 Run with:   .venv/bin/python3 converter_app.py
 Requires:   bin/cjpegli  (built from github.com/google/jpegli)
-            pip install Pillow numpy
+            pip install Pillow
 """
 
 import os
@@ -18,6 +18,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image
+
+TIFF_SUFFIXES = {".tif", ".tiff"}
 
 # ---------------------------------------------------------------------------
 # Binary detection
@@ -54,7 +56,8 @@ def find_exiftool() -> str | None:
 # ---------------------------------------------------------------------------
 
 def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str,
-                 exiftool: str | None = None) -> None:
+                 exiftool: str | None = None,
+                 strip_metadata: bool = False) -> None:
     """
     Convert a single TIFF to JPEG via cjpegli, preserving all metadata.
 
@@ -96,7 +99,7 @@ def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str,
         os.unlink(tmp_path)
 
     # Copy EXIF, IPTC, XMP from original TIFF into the output JPEG
-    if exiftool and dst.exists():
+    if not strip_metadata and exiftool and dst.exists():
         subprocess.run(
             [
                 exiftool,
@@ -142,6 +145,10 @@ class ConverterApp(tk.Tk):
 
         self.cjpegli = find_cjpegli()
         self.exiftool = find_exiftool()
+        self._mode = tk.StringVar(value="folder")
+        self._mirror_tree = tk.BooleanVar(value=False)
+        self._strip_metadata = tk.BooleanVar(value=False)
+        self._input_file: Path | None = None
         self._input_dir: Path | None = None
         self._output_dir: Path | None = None
         self._tiff_files: list[Path] = []
@@ -157,29 +164,75 @@ class ConverterApp(tk.Tk):
     def _build_ui(self):
         PAD_X = 12
 
-        # ── Input folder ──────────────────────────────────────────────
-        frm_in = ttk.LabelFrame(self, text="Input folder (TIFF files)")
-        frm_in.grid(row=0, column=0, sticky="ew", padx=PAD_X, pady=(12, 4))
+        # ── Mode selector ─────────────────────────────────────────────
+        frm_mode = ttk.LabelFrame(self, text="Mode")
+        frm_mode.grid(row=0, column=0, sticky="ew", padx=PAD_X, pady=(12, 4))
+
+        ttk.Radiobutton(
+            frm_mode,
+            text="Single File",
+            value="file",
+            variable=self._mode,
+            command=self._on_mode_change,
+        ).grid(row=0, column=0, padx=(8, 6), pady=6)
+        ttk.Radiobutton(
+            frm_mode,
+            text="Single Folder",
+            value="folder",
+            variable=self._mode,
+            command=self._on_mode_change,
+        ).grid(row=0, column=1, padx=6, pady=6)
+        ttk.Radiobutton(
+            frm_mode,
+            text="All Subfolders",
+            value="tree",
+            variable=self._mode,
+            command=self._on_mode_change,
+        ).grid(row=0, column=2, padx=6, pady=6)
+
+        # ── Input picker ──────────────────────────────────────────────
+        self._frm_in = ttk.LabelFrame(self, text="Input folder (TIFF files)")
+        self._frm_in.grid(row=1, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._in_var = tk.StringVar(value="(no folder selected)")
-        ttk.Label(frm_in, textvariable=self._in_var, width=52,
+        ttk.Label(self._frm_in, textvariable=self._in_var, width=52,
                   anchor="w").grid(row=0, column=0, padx=8, pady=4)
-        ttk.Button(frm_in, text="Browse…",
-                   command=self._pick_input).grid(row=0, column=1, padx=(0, 8))
+        self._input_btn = ttk.Button(self._frm_in, text="Browse…",
+                                     command=self._pick_input)
+        self._input_btn.grid(row=0, column=1, padx=(0, 8))
 
         # ── Output folder ─────────────────────────────────────────────
-        frm_out = ttk.LabelFrame(self, text="Output folder")
-        frm_out.grid(row=1, column=0, sticky="ew", padx=PAD_X, pady=4)
+        self._frm_out = ttk.LabelFrame(self, text="Output folder")
+        self._frm_out.grid(row=2, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._out_var = tk.StringVar(value="(same as input / converted)")
-        ttk.Label(frm_out, textvariable=self._out_var, width=52,
+        ttk.Label(self._frm_out, textvariable=self._out_var, width=52,
                   anchor="w").grid(row=0, column=0, padx=8, pady=4)
-        ttk.Button(frm_out, text="Browse…",
+        ttk.Button(self._frm_out, text="Browse…",
                    command=self._pick_output).grid(row=0, column=1, padx=(0, 8))
+
+        # ── Options ───────────────────────────────────────────────────
+        self._frm_opts = ttk.Frame(self)
+        self._frm_opts.grid(row=3, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
+
+        self._mirror_chk = ttk.Checkbutton(
+            self._frm_opts,
+            text="Mirror folder structure to output folder",
+            variable=self._mirror_tree,
+            command=self._scan_files,
+        )
+        self._mirror_chk.grid(row=0, column=0, sticky="w", pady=(0, 2))
+
+        self._strip_meta_chk = ttk.Checkbutton(
+            self._frm_opts,
+            text="Strip all metadata",
+            variable=self._strip_metadata,
+        )
+        self._strip_meta_chk.grid(row=1, column=0, sticky="w")
 
         # ── Quality slider ────────────────────────────────────────────
         frm_q = ttk.LabelFrame(self, text="Quality")
-        frm_q.grid(row=2, column=0, sticky="ew", padx=PAD_X, pady=4)
+        frm_q.grid(row=4, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._quality = tk.IntVar(value=85)
         slider = ttk.Scale(frm_q, from_=1, to=100, orient="horizontal",
@@ -192,7 +245,7 @@ class ConverterApp(tk.Tk):
 
         # ── File list ─────────────────────────────────────────────────
         frm_list = ttk.LabelFrame(self, text="Files found")
-        frm_list.grid(row=3, column=0, sticky="ew", padx=PAD_X, pady=4)
+        frm_list.grid(row=5, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._listbox = tk.Listbox(frm_list, height=8, width=62,
                                    selectmode="browse", font=("Menlo", 11))
@@ -208,7 +261,7 @@ class ConverterApp(tk.Tk):
 
         # ── Progress ──────────────────────────────────────────────────
         frm_prog = ttk.Frame(self)
-        frm_prog.grid(row=4, column=0, sticky="ew", padx=PAD_X, pady=4)
+        frm_prog.grid(row=6, column=0, sticky="ew", padx=PAD_X, pady=4)
 
         self._progress = ttk.Progressbar(frm_prog, length=400, mode="determinate")
         self._progress.grid(row=0, column=0, padx=(0, 10))
@@ -219,7 +272,7 @@ class ConverterApp(tk.Tk):
 
         # ── Metadata status ───────────────────────────────────────────
         frm_meta = ttk.Frame(self)
-        frm_meta.grid(row=5, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
+        frm_meta.grid(row=7, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
         self._meta_var = tk.StringVar()
         ttk.Label(frm_meta, textvariable=self._meta_var,
                   foreground="gray").grid(row=0, column=0)
@@ -227,9 +280,10 @@ class ConverterApp(tk.Tk):
         # ── Convert button ────────────────────────────────────────────
         self._convert_btn = ttk.Button(self, text="Convert",
                                        command=self._start_conversion)
-        self._convert_btn.grid(row=6, column=0, pady=(4, 14))
+        self._convert_btn.grid(row=8, column=0, pady=(4, 14))
 
         self.columnconfigure(0, weight=1)
+        self._on_mode_change()
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -252,14 +306,50 @@ class ConverterApp(tk.Tk):
         else:
             self._meta_var.set("⚠ exiftool not found — ICC profile only, no EXIF/XMP transfer.")
 
+    def _on_mode_change(self):
+        mode = self._mode.get()
+
+        if mode == "file":
+            self._frm_in.config(text="Input TIFF file")
+            self._in_var.set(str(self._input_file) if self._input_file else "(no file selected)")
+            self._frm_out.grid_remove()
+            self._mirror_tree.set(False)
+            self._mirror_chk.grid_remove()
+        elif mode == "folder":
+            self._frm_in.config(text="Input folder (TIFF files)")
+            self._in_var.set(str(self._input_dir) if self._input_dir else "(no folder selected)")
+            self._frm_out.grid()
+            self._mirror_tree.set(False)
+            self._mirror_chk.grid_remove()
+        else:
+            self._frm_in.config(text="Input root folder (recursive TIFF scan)")
+            self._in_var.set(str(self._input_dir) if self._input_dir else "(no folder selected)")
+            self._frm_out.grid()
+            self._mirror_chk.grid()
+
+        self._scan_files()
+
     def _pick_input(self):
+        if self._mode.get() == "file":
+            file_path = filedialog.askopenfilename(
+                title="Select a TIFF file",
+                filetypes=[("TIFF files", "*.tif *.tiff"), ("All files", "*")],
+            )
+            if not file_path:
+                return
+            self._input_file = Path(file_path)
+            self._input_dir = self._input_file.parent
+            self._in_var.set(str(self._input_file))
+            self._scan_files()
+            return
+
         d = filedialog.askdirectory(title="Select folder containing TIFF files")
         if not d:
             return
         self._input_dir = Path(d)
+        self._input_file = None
         self._in_var.set(str(self._input_dir))
 
-        # Default output = input/converted/
         if self._output_dir is None:
             default_out = self._input_dir / "converted"
             self._output_dir = default_out
@@ -274,20 +364,57 @@ class ConverterApp(tk.Tk):
             self._out_var.set(str(self._output_dir))
 
     def _scan_files(self):
-        if not self._input_dir:
-            return
-        files = sorted(
-            p for p in self._input_dir.iterdir()
-            if p.suffix.lower() in {".tif", ".tiff"}
-        )
+        mode = self._mode.get()
+
+        if mode == "file":
+            files = [self._input_file] if self._input_file and self._input_file.exists() else []
+        elif mode == "folder":
+            if not self._input_dir:
+                files = []
+            else:
+                files = sorted(
+                    p for p in self._input_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in TIFF_SUFFIXES
+                )
+        else:
+            if not self._input_dir:
+                files = []
+            else:
+                files = sorted(
+                    p for p in self._input_dir.rglob("*")
+                    if p.is_file() and p.suffix.lower() in TIFF_SUFFIXES
+                )
+
         self._tiff_files = files
         self._listbox.delete(0, tk.END)
         for f in files:
-            self._listbox.insert(tk.END, f.name)
+            if mode == "tree" and self._input_dir:
+                self._listbox.insert(tk.END, str(f.relative_to(self._input_dir)))
+            else:
+                self._listbox.insert(tk.END, f.name)
         n = len(files)
         self._count_label.config(
             text=f"{n} TIFF file{'s' if n != 1 else ''} found."
         )
+
+    def _compute_output_path(self, src: Path) -> Path:
+        mode = self._mode.get()
+
+        if mode == "file":
+            return src.parent / (src.stem + ".jpg")
+
+        if mode == "folder":
+            if not self._output_dir:
+                raise RuntimeError("Output folder not set")
+            return self._output_dir / (src.stem + ".jpg")
+
+        if self._mirror_tree.get():
+            if not self._output_dir or not self._input_dir:
+                raise RuntimeError("Output or input folder not set")
+            rel_parent = src.relative_to(self._input_dir).parent
+            return self._output_dir / rel_parent / (src.stem + ".jpg")
+
+        return src.parent / "converted" / (src.stem + ".jpg")
 
     def _update_quality_label(self, _=None):
         self._q_label.config(text=self._quality_label_text())
@@ -307,10 +434,15 @@ class ConverterApp(tk.Tk):
         if self._running:
             return
         if not self._tiff_files:
-            messagebox.showwarning("No files", "No TIFF files found in the input folder.")
+            messagebox.showwarning("No files", "No TIFF files found for the selected mode.")
             return
-        if not self._output_dir:
+
+        mode = self._mode.get()
+        if mode == "folder" and not self._output_dir:
             messagebox.showwarning("No output", "Please choose an output folder.")
+            return
+        if mode == "tree" and self._mirror_tree.get() and not self._output_dir:
+            messagebox.showwarning("No output", "Please choose an output folder for mirrored output.")
             return
 
         self._running = True
@@ -326,10 +458,17 @@ class ConverterApp(tk.Tk):
         self._set_progress(0, total)
 
         for i, src in enumerate(files, start=1):
-            dst = self._output_dir / (src.stem + ".jpg")
             self._update_status(f"{i - 1} / {total}")
             try:
-                convert_tiff(src, dst, quality, self.cjpegli, self.exiftool)
+                dst = self._compute_output_path(src)
+                convert_tiff(
+                    src,
+                    dst,
+                    quality,
+                    self.cjpegli,
+                    self.exiftool,
+                    strip_metadata=self._strip_metadata.get(),
+                )
             except Exception as exc:
                 errors.append(f"{src.name}: {exc}")
             self._set_progress(i, total)
