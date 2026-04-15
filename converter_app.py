@@ -325,7 +325,8 @@ class ConverterApp(tk.Tk):
         )
         self._resize_w_entry.grid(row=0, column=1)
 
-        ttk.Label(self._resize_row, text="×").grid(row=0, column=2, padx=4)
+        self._resize_mul_lbl = ttk.Label(self._resize_row, text="×")
+        self._resize_mul_lbl.grid(row=0, column=2, padx=4)
 
         self._resize_h_entry = ttk.Entry(
             self._resize_row, textvariable=self._resize_h, width=7
@@ -431,13 +432,19 @@ class ConverterApp(tk.Tk):
         if mode == "wh":
             self._resize_val_entry.grid_remove()
             self._resize_w_entry.grid()
+            self._resize_mul_lbl.grid()
+            self._resize_h_entry.grid()
             self._resize_unit_lbl.config(text="px")
         elif mode == "percentage":
             self._resize_w_entry.grid_remove()
+            self._resize_mul_lbl.grid_remove()
+            self._resize_h_entry.grid_remove()
             self._resize_val_entry.grid()
             self._resize_unit_lbl.config(text="%")
         else:
             self._resize_w_entry.grid_remove()
+            self._resize_mul_lbl.grid_remove()
+            self._resize_h_entry.grid_remove()
             self._resize_val_entry.grid()
             self._resize_unit_lbl.config(text="px")
 
@@ -587,8 +594,8 @@ class ConverterApp(tk.Tk):
                 val = int(self._resize_value.get())
                 if val <= 0:
                     raise ValueError
-                if mode == "percentage" and val >= 100:
-                    raise ValueError("Percentage must be less than 100.")
+                if mode == "percentage" and val > 100:
+                    raise ValueError("Percentage must be 100 or less.")
                 return True, mode, val, 0, 0
         except ValueError as exc:
             label = next((v for k, v in RESIZE_MODES if k == mode), mode)
