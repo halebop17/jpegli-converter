@@ -5,3 +5,9 @@ __pycache__/
 .vscode/
 TIFF Converter.app/
 check_tiff.py
+build/
+dist/
+*.dmg
+*.pkg
+
+*.spec.tmp

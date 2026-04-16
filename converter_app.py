@@ -12,6 +12,7 @@ Requires:   bin/cjpegli  (built from github.com/google/jpegli)
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -36,9 +37,16 @@ RESIZE_MODES = [
 # Binary detection
 # ---------------------------------------------------------------------------
 
-# Resolve the directory where this script lives, so bin/cjpegli is found
-# regardless of the working directory.
-_SCRIPT_DIR = Path(__file__).resolve().parent
+def _resource_root() -> Path:
+    """Return the directory that contains bundled runtime resources."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
+
+# Resolve the directory that contains runtime resources so bundled binaries are
+# found both in development and in a frozen app.
+_SCRIPT_DIR = _resource_root()
 
 CJPEGLI_CANDIDATES = [
     str(_SCRIPT_DIR / "bin" / "cjpegli"),   # bundled binary (primary)
@@ -56,7 +64,11 @@ def find_cjpegli() -> str | None:
 
 
 def find_exiftool() -> str | None:
-    for path in ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool"]:
+    for path in [
+        str(_SCRIPT_DIR / "bin" / "exiftool"),
+        "/opt/homebrew/bin/exiftool",
+        "/usr/local/bin/exiftool",
+    ]:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     return shutil.which("exiftool")
