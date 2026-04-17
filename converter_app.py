@@ -457,7 +457,8 @@ class ConverterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("JPG Master - JPEGLI & JXL Converter")
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(900, 640)
 
         self.cjpegli = find_cjpegli()
         self.cjxl = find_cjxl()
@@ -483,6 +484,8 @@ class ConverterApp(tk.Tk):
         self._tiff_files: list[Path] = []
         self._worker_count = tk.IntVar(value=2)
         self._running = False
+        self._cancel_requested = False
+        self._tree_items: dict[Path, str] = {}
 
         self._build_ui()
         self._on_format_change()
@@ -495,8 +498,15 @@ class ConverterApp(tk.Tk):
     def _build_ui(self):
         PAD_X = 12
 
+        # ── Setup frame (hidden when conversion runs) ─────────────────
+        self._frm_setup = ttk.Frame(self)
+        self._frm_setup.grid(row=0, column=0, sticky="nsew")
+        self._frm_setup.columnconfigure(0, weight=0)  # controls — fixed width
+        self._frm_setup.columnconfigure(1, weight=1)  # file list — expands
+        self._frm_setup.rowconfigure(0, weight=1)
+
         # ── Mode selector ─────────────────────────────────────────────
-        frm_mode = ttk.LabelFrame(self, text="Mode")
+        frm_mode = ttk.LabelFrame(self._frm_setup, text="Mode")
         frm_mode.grid(row=0, column=0, sticky="ew", padx=PAD_X, pady=(12, 4))
 
         ttk.Radiobutton(
@@ -522,7 +532,7 @@ class ConverterApp(tk.Tk):
         ).grid(row=0, column=2, padx=6, pady=6)
 
         # ── Input picker ──────────────────────────────────────────────
-        self._frm_in = ttk.LabelFrame(self, text="Input folder (TIFF files)")
+        self._frm_in = ttk.LabelFrame(self._frm_setup, text="Input folder (TIFF files)")
 
         self._in_var = tk.StringVar(value="(no folder selected)")
         ttk.Label(self._frm_in, textvariable=self._in_var, width=52,
@@ -532,16 +542,16 @@ class ConverterApp(tk.Tk):
         self._input_btn.grid(row=0, column=1, padx=(0, 8))
 
         # ── Output folder ─────────────────────────────────────────────
-        self._frm_out = ttk.LabelFrame(self, text="Output folder")
+        self._frm_out = ttk.LabelFrame(self._frm_setup, text="Output folder")
 
-        self._out_var = tk.StringVar(value="(same as input / converted)")
+        self._out_var = tk.StringVar(value="(defaults to /converted in source folder)")
         ttk.Label(self._frm_out, textvariable=self._out_var, width=52,
                   anchor="w").grid(row=0, column=0, padx=8, pady=4)
         ttk.Button(self._frm_out, text="Browse…",
                    command=self._pick_output).grid(row=0, column=1, padx=(0, 8))
 
         # ── Quality slider ────────────────────────────────────────────
-        self._frm_q = ttk.LabelFrame(self, text="Quality")
+        self._frm_q = ttk.LabelFrame(self._frm_setup, text="Quality")
 
         self._quality = tk.IntVar(value=85)
         slider = ttk.Scale(self._frm_q, from_=1, to=100, orient="horizontal",
@@ -553,7 +563,7 @@ class ConverterApp(tk.Tk):
         self._q_label.grid(row=1, column=0, padx=10, pady=(0, 6))
 
         # ── Export format ─────────────────────────────────────────────
-        self._frm_format = ttk.LabelFrame(self, text="Export format")
+        self._frm_format = ttk.LabelFrame(self._frm_setup, text="Export format")
 
         ttk.Radiobutton(
             self._frm_format,
@@ -577,7 +587,7 @@ class ConverterApp(tk.Tk):
         self._input_hint_lbl.grid(row=1, column=0, columnspan=2, padx=8, pady=(0, 6), sticky="w")
 
         # ── JXL Encode Effort ─────────────────────────────────────────
-        self._frm_effort = ttk.LabelFrame(self, text="JXL Encode Effort")
+        self._frm_effort = ttk.LabelFrame(self._frm_setup, text="JXL Encode Effort")
 
         effort_slider = ttk.Scale(
             self._frm_effort, from_=1, to=9, orient="horizontal",
@@ -592,7 +602,7 @@ class ConverterApp(tk.Tk):
         self._effort_label.grid(row=1, column=0, padx=10, pady=(0, 6))
 
         # ── Folder structure options ─────────────────────────────────
-        self._frm_structure = ttk.LabelFrame(self, text="Folder structure")
+        self._frm_structure = ttk.LabelFrame(self._frm_setup, text="Folder structure")
 
         self._mirror_chk = ttk.Checkbutton(
             self._frm_structure,
@@ -603,7 +613,7 @@ class ConverterApp(tk.Tk):
         self._mirror_chk.grid(row=0, column=0, sticky="w", padx=8, pady=6)
 
         # ── Image Sizing ──────────────────────────────────────────────
-        self._frm_size = ttk.LabelFrame(self, text="Image Sizing")
+        self._frm_size = ttk.LabelFrame(self._frm_setup, text="Image Sizing")
 
         ttk.Checkbutton(
             self._frm_size,
@@ -648,7 +658,7 @@ class ConverterApp(tk.Tk):
         self._resize_row.grid_remove()
 
         # ── Metadata options ─────────────────────────────────────────
-        self._frm_metadata = ttk.LabelFrame(self, text="Metadata")
+        self._frm_metadata = ttk.LabelFrame(self._frm_setup, text="Metadata")
 
         self._strip_meta_chk = ttk.Checkbutton(
             self._frm_metadata,
@@ -658,40 +668,44 @@ class ConverterApp(tk.Tk):
         )
         self._strip_meta_chk.grid(row=0, column=0, sticky="w", padx=8, pady=6)
 
-        # ── File list ─────────────────────────────────────────────────
-        self._frm_list = ttk.LabelFrame(self, text="Files found")
+        # ── File list — right panel (replaces Listbox, spans full height) ───
+        self._frm_list = ttk.LabelFrame(self._frm_setup, text="Files found")
+        self._frm_list.columnconfigure(0, weight=1)
+        self._frm_list.rowconfigure(0, weight=1)
 
-        self._listbox = tk.Listbox(self._frm_list, height=8, width=62,
-                                   selectmode="browse", font=("Menlo", 11))
-        scrollbar = ttk.Scrollbar(self._frm_list, orient="vertical",
-                                  command=self._listbox.yview)
-        self._listbox.configure(yscrollcommand=scrollbar.set)
-        self._listbox.grid(row=0, column=0, padx=(8, 0), pady=6)
-        scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=6)
+        self._setup_tree = ttk.Treeview(
+            self._frm_list,
+            columns=("file",),
+            show="headings",
+            height=20,
+            selectmode="browse",
+        )
+        self._setup_tree.heading("file", text="Filename")
+        self._setup_tree.column("file", width=300, minwidth=160, stretch=True)
+        _setup_vsb = ttk.Scrollbar(self._frm_list, orient="vertical",
+                                    command=self._setup_tree.yview)
+        self._setup_tree.configure(yscrollcommand=_setup_vsb.set)
+        self._setup_tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=6)
+        _setup_vsb.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=6)
 
         self._count_label = ttk.Label(self._frm_list, text="No files selected.")
         self._count_label.grid(row=1, column=0, columnspan=2,
-                                padx=8, pady=(0, 6), sticky="w")
+                                padx=8, pady=(0, 4), sticky="w")
 
-        # ── Progress ──────────────────────────────────────────────────
-        self._frm_prog = ttk.Frame(self)
-
-        self._progress = ttk.Progressbar(self._frm_prog, length=400, mode="determinate")
-        self._progress.grid(row=0, column=0, padx=(0, 10))
-
-        self._status_var = tk.StringVar(value="Ready.")
-        ttk.Label(self._frm_prog, textvariable=self._status_var, width=18,
-                  anchor="w").grid(row=0, column=1)
-
-        # ── Metadata status ───────────────────────────────────────────
-        self._frm_meta = ttk.Frame(self)
-        self._frm_meta.grid(row=8, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
+        # ── Metadata status (lives inside the file list panel) ────────
+        self._frm_meta = ttk.Frame(self._frm_list)
         self._meta_var = tk.StringVar()
         ttk.Label(self._frm_meta, textvariable=self._meta_var,
                   foreground="gray").grid(row=0, column=0)
+        self._frm_meta.grid(row=2, column=0, columnspan=2,
+                             padx=8, pady=(0, 6), sticky="w")
+
+        # Place file list statically in right column, spanning all rows
+        self._frm_list.grid(row=0, column=1, rowspan=25,
+                             sticky="nsew", padx=(4, PAD_X), pady=12)
 
         # ── Parallel conversions ──────────────────────────────────────
-        self._frm_workers = ttk.LabelFrame(self, text="Parallel conversions")
+        self._frm_workers = ttk.LabelFrame(self._frm_setup, text="Parallel conversions")
 
         for value, label in [(1, "1  (sequential)"), (2, "2  (recommended)"), (4, "4  (fast)"), (6, "6  (fastest)")]:
             ttk.Radiobutton(
@@ -702,12 +716,94 @@ class ConverterApp(tk.Tk):
             ).grid(row=0, column=value - 1, padx=(8 if value == 1 else 6, 6), pady=6)
 
         # ── Convert button ────────────────────────────────────────────
-        self._convert_btn = ttk.Button(self, text="Convert",
+        self._convert_btn = ttk.Button(self._frm_setup, text="Convert",
                                        command=self._start_conversion)
 
         self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         self._on_mode_change()
         self._update_metadata_status_visibility()
+
+        # ── Conversion frame (shown after Convert is clicked) ─────────
+        self._frm_conv = ttk.Frame(self)
+        self._frm_conv.columnconfigure(0, weight=1)
+        self._frm_conv.rowconfigure(1, weight=1)
+        _PAD = 12
+
+        self._conv_title_var = tk.StringVar(value="Conversion in progress...")
+        ttk.Label(self._frm_conv, textvariable=self._conv_title_var,
+                  font=("", 13, "bold")).grid(
+                      row=0, column=0, columnspan=2,
+                      padx=_PAD, pady=(12, 6), sticky="w")
+
+        _tree_frm = ttk.Frame(self._frm_conv)
+        _tree_frm.grid(row=1, column=0, columnspan=2, sticky="nsew",
+                       padx=_PAD, pady=(0, 4))
+        _tree_frm.columnconfigure(0, weight=1)
+        _tree_frm.rowconfigure(0, weight=1)
+
+        self._conv_tree = ttk.Treeview(
+            _tree_frm,
+            columns=("file", "status", "notes"),
+            show="headings",
+            height=24,
+        )
+        self._conv_tree.heading("file",   text="Original File")
+        self._conv_tree.heading("status", text="Status")
+        self._conv_tree.heading("notes",  text="Notes")
+        self._conv_tree.column("file",   width=360, minwidth=200, stretch=True)
+        self._conv_tree.column("status", width=110, minwidth=90,  stretch=False)
+        self._conv_tree.column("notes",  width=220, minwidth=100, stretch=True)
+
+        _tree_vsb = ttk.Scrollbar(_tree_frm, orient="vertical",
+                                   command=self._conv_tree.yview)
+        self._conv_tree.configure(yscrollcommand=_tree_vsb.set)
+        self._conv_tree.grid(row=0, column=0, sticky="nsew")
+        _tree_vsb.grid(row=0, column=1, sticky="ns")
+
+        self._conv_tree.tag_configure("waiting",    foreground="#888888")
+        self._conv_tree.tag_configure("processing", background="#1a2a4a", foreground="#aaccff")
+        self._conv_tree.tag_configure("converted",  background="#1a3a1a", foreground="#88ee88")
+        self._conv_tree.tag_configure("failed",     background="#3a1a1a", foreground="#ff8888")
+        self._conv_tree.tag_configure("cancelled",  foreground="#666666")
+
+        _frm_prog_conv = ttk.Frame(self._frm_conv)
+        _frm_prog_conv.grid(row=2, column=0, columnspan=2, sticky="ew",
+                            padx=_PAD, pady=(0, 4))
+        _frm_prog_conv.columnconfigure(0, weight=1)
+
+        self._conv_progress = ttk.Progressbar(
+            _frm_prog_conv, length=500, mode="determinate")
+        self._conv_progress.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        self._conv_counter_var = tk.StringVar(value="")
+        ttk.Label(_frm_prog_conv, textvariable=self._conv_counter_var,
+                  width=16, anchor="w").grid(row=0, column=1)
+
+        _frm_btns = ttk.Frame(self._frm_conv)
+        _frm_btns.grid(row=3, column=0, columnspan=2, pady=(2, 8),
+                       padx=_PAD, sticky="w")
+
+        self._cancel_btn = ttk.Button(_frm_btns, text="Cancel",
+                                      command=self._cancel_conversion)
+        self._cancel_btn.grid(row=0, column=0, padx=(0, 8))
+
+        self._back_btn = ttk.Button(_frm_btns, text="\u2190 Back to Settings",
+                                    command=self._back_to_settings)
+        self._back_btn.grid(row=0, column=1)
+        self._back_btn.state(["disabled"])
+
+        self._frm_errlog = ttk.LabelFrame(self._frm_conv, text="Errors")
+        self._frm_errlog.columnconfigure(0, weight=1)
+        self._conv_errlog = tk.Text(
+            self._frm_errlog, height=5, wrap="word",
+            state="disabled", font=("Menlo", 10))
+        _errlog_vsb = ttk.Scrollbar(self._frm_errlog, orient="vertical",
+                                     command=self._conv_errlog.yview)
+        self._conv_errlog.configure(yscrollcommand=_errlog_vsb.set)
+        self._conv_errlog.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=6)
+        _errlog_vsb.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=6)
+        # _frm_errlog is not gridded yet; shown only when there are errors
 
     def _apply_mode_layout(self):
         PAD_X = 12
@@ -724,6 +820,12 @@ class ConverterApp(tk.Tk):
             self._frm_out.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
             row += 1
 
+        if mode == "tree":
+            self._frm_structure.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+            row += 1
+        else:
+            self._frm_structure.grid_remove()
+
         self._frm_format.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
         row += 1
 
@@ -736,25 +838,10 @@ class ConverterApp(tk.Tk):
         else:
             self._frm_effort.grid_remove()
 
-        if mode == "tree":
-            self._frm_structure.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
-            row += 1
-        else:
-            self._frm_structure.grid_remove()
-
         self._frm_size.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
         row += 1
 
         self._frm_metadata.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
-        row += 1
-
-        self._frm_list.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
-        row += 1
-
-        self._frm_prog.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
-        row += 1
-
-        self._frm_meta.grid(row=row, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
         row += 1
 
         self._frm_workers.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
@@ -842,18 +929,18 @@ class ConverterApp(tk.Tk):
             self._in_var.set(str(self._input_file) if self._input_file else "(no file selected)")
             self._mirror_tree.set(False)
             if self._output_dir is None:
-                self._out_var.set("(same as input / converted)")
+                self._out_var.set("(defaults to /converted in source folder)")
         elif mode == "folder":
             self._frm_in.config(text=folder_label)
             self._in_var.set(str(self._input_dir) if self._input_dir else "(no folder selected)")
             self._mirror_tree.set(False)
             if self._output_dir is None:
-                self._out_var.set("(same as input / converted)")
+                self._out_var.set("(defaults to /converted in source folder)")
         else:
             self._frm_in.config(text=tree_label)
             self._in_var.set(str(self._input_dir) if self._input_dir else "(no folder selected)")
             if self._output_dir is None:
-                self._out_var.set("(same as input folders in /converted)")
+                self._out_var.set("(defaults to /converted in source folders)")
 
         self._apply_mode_layout()
         self._scan_files()
@@ -898,7 +985,7 @@ class ConverterApp(tk.Tk):
             self._output_dir = default_out
             self._out_var.set(str(default_out))
         elif self._output_dir is None and self._mode.get() == "tree":
-            self._out_var.set("(same as input folders in /converted)")
+            self._out_var.set("(defaults to /converted in source folders)")
 
         self._scan_files()
 
@@ -937,12 +1024,24 @@ class ConverterApp(tk.Tk):
                 )
 
         self._tiff_files = files
-        self._listbox.delete(0, tk.END)
+        if hasattr(self, "_setup_tree"):
+            for child in self._setup_tree.get_children():
+                self._setup_tree.delete(child)
+        if hasattr(self, "_conv_tree"):
+            for child in self._conv_tree.get_children():
+                self._conv_tree.delete(child)
+        self._tree_items.clear()
         for f in files:
             if mode == "tree" and self._input_dir:
-                self._listbox.insert(tk.END, str(f.relative_to(self._input_dir)))
+                display = str(f.relative_to(self._input_dir))
             else:
-                self._listbox.insert(tk.END, f.name)
+                display = f.name
+            if hasattr(self, "_setup_tree"):
+                self._setup_tree.insert("", tk.END, values=(display,))
+            if hasattr(self, "_conv_tree"):
+                iid = self._conv_tree.insert(
+                    "", tk.END, values=(display, "Waiting", ""), tags=("waiting",))
+                self._tree_items[f] = iid
         n = len(files)
         self._count_label.config(
             text=f"{n} file{'s' if n != 1 else ''} found."
@@ -1029,8 +1128,7 @@ class ConverterApp(tk.Tk):
             else:
                 self._convert_btn.state(["disabled"])
         self._update_quality_label()
-        self._apply_mode_layout()
-        self._scan_files()
+        self._on_mode_change()
 
     def _parse_resize_params(self) -> tuple[bool, str, int, int, int]:
         """Validate and return (enabled, mode, value, w, h). Raises ValueError on bad input."""
@@ -1107,6 +1205,27 @@ class ConverterApp(tk.Tk):
         self._convert_btn.state(["disabled"])
         for child in self._frm_workers.winfo_children():
             child.state(["disabled"])
+
+        # Prepare conversion frame
+        self._cancel_requested = False
+        self._cancel_btn.state(["!disabled"])
+        self._back_btn.state(["disabled"])
+        self._conv_title_var.set("Conversion in progress...")
+        for iid in self._tree_items.values():
+            old_vals = self._conv_tree.item(iid, "values")
+            filename = old_vals[0] if old_vals else ""
+            self._conv_tree.item(iid, values=(filename, "Waiting", ""), tags=("waiting",))
+        self._frm_errlog.grid_remove()
+        self._conv_errlog.config(state="normal")
+        self._conv_errlog.delete("1.0", tk.END)
+        self._conv_errlog.config(state="disabled")
+        self._conv_progress.config(value=0)
+        self._conv_counter_var.set(f"0 / {len(self._tiff_files)}")
+
+        # Switch to conversion frame
+        self._frm_setup.grid_remove()
+        self._frm_conv.grid(row=0, column=0, sticky="nsew")
+
         threading.Thread(target=self._run_conversion, daemon=True).start()
 
     def _convert_one(self, src: Path, fmt: str, quality: int, effort: int,
@@ -1150,14 +1269,16 @@ class ConverterApp(tk.Tk):
         workers = self._worker_count.get()
         resize_enabled, resize_mode, resize_value, resize_w, resize_h = self._parse_resize_params()
         errors: list[str] = []
-
-        self._set_progress(0, total)
-        self._update_status(f"0 / {total}")
+        cancelled_files: set[Path] = set()
 
         lock = threading.Lock()
-        done_count = [0]  # mutable container for closure
+        done_count = [0]
 
         def run_one(src: Path):
+            if self._cancel_requested:
+                cancelled_files.add(src)
+                return
+            self.after(0, lambda s=src: self._update_row_status(s, "processing"))
             self._convert_one(
                 src, fmt, quality, effort, strip_metadata,
                 resize_enabled, resize_mode, resize_value, resize_w, resize_h,
@@ -1169,38 +1290,83 @@ class ConverterApp(tk.Tk):
                 src = future_to_src[future]
                 try:
                     future.result()
+                    if src in cancelled_files:
+                        self.after(0, lambda s=src: self._update_row_status(s, "cancelled"))
+                    else:
+                        self.after(0, lambda s=src: self._update_row_status(s, "converted"))
                 except Exception as exc:
-                    errors.append(f"{src.name}: {exc}")
+                    err_msg = str(exc)
+                    errors.append(f"{src.name}: {err_msg}")
+                    self.after(0, lambda s=src, e=err_msg: self._update_row_status(s, "failed", e))
                 with lock:
                     done_count[0] += 1
                     count = done_count[0]
-                self.after(0, lambda c=count: self._set_progress(c, total))
-                self.after(0, lambda c=count: self._update_status(f"{c} / {total}"))
+                self.after(0, lambda c=count: self._update_conv_progress(c, total))
 
         self._running = False
-        self.after(0, self._on_done, total, errors)
+        self.after(0, self._on_done, total, errors, len(cancelled_files))
 
-    def _set_progress(self, value: int, maximum: int):
-        pct = int(value / maximum * 100) if maximum else 0
-        self.after(0, lambda: self._progress.config(value=pct))
-
-    def _update_status(self, text: str):
-        self.after(0, lambda: self._status_var.set(text))
-
-    def _on_done(self, total: int, errors: list[str]):
+    def _on_done(self, total: int, errors: list[str], cancelled_count: int = 0):
         self._convert_btn.state(["!disabled"])
         for child in self._frm_workers.winfo_children():
             child.state(["!disabled"])
-        self._update_status("Done.")
+        self._cancel_btn.state(["disabled"])
+        self._back_btn.state(["!disabled"])
 
-        ok = total - len(errors)
-        msg = f"Converted {ok} of {total} file{'s' if total != 1 else ''} successfully."
-        if errors:
-            msg += f"\n\n{len(errors)} error{'s' if len(errors) != 1 else ''}:\n"
-            msg += "\n".join(f"  • {e}" for e in errors)
-            messagebox.showwarning("Conversion complete", msg)
+        ok = total - len(errors) - cancelled_count
+        if cancelled_count > 0 and not errors:
+            self._conv_title_var.set(
+                f"Conversion cancelled  \u2014  {ok} converted, {cancelled_count} cancelled"
+            )
+        elif cancelled_count > 0 and errors:
+            self._conv_title_var.set(
+                f"Conversion cancelled  \u2014  {ok} converted, "
+                f"{cancelled_count} cancelled, {len(errors)} failed"
+            )
+        elif errors:
+            self._conv_title_var.set(
+                f"Conversion complete  \u2014  {ok} converted, {len(errors)} failed"
+            )
         else:
-            messagebox.showinfo("Conversion complete", msg)
+            self._conv_title_var.set(
+                f"Conversion complete  \u2014  {ok} of {total} converted successfully"
+            )
+
+        if errors:
+            self._conv_errlog.config(state="normal")
+            self._conv_errlog.delete("1.0", tk.END)
+            for e in errors:
+                self._conv_errlog.insert(tk.END, f"\u2022 {e}\n")
+            self._conv_errlog.config(state="disabled")
+            self._frm_errlog.grid(row=4, column=0, columnspan=2,
+                                  sticky="ew", padx=12, pady=(0, 12))
+
+    def _update_row_status(self, src: Path, status: str, note: str = "") -> None:
+        iid = self._tree_items.get(src)
+        if not iid:
+            return
+        old_vals = self._conv_tree.item(iid, "values")
+        filename = old_vals[0] if old_vals else src.name
+        self._conv_tree.item(iid, values=(filename, status.capitalize(), note), tags=(status,))
+        if status == "processing":
+            self._conv_tree.see(iid)
+
+    def _update_conv_progress(self, value: int, maximum: int) -> None:
+        pct = int(value / maximum * 100) if maximum else 0
+        self._conv_progress.config(value=pct)
+        self._conv_counter_var.set(f"{value} / {maximum}")
+
+    def _cancel_conversion(self) -> None:
+        self._cancel_requested = True
+        self._cancel_btn.state(["disabled"])
+
+    def _back_to_settings(self) -> None:
+        self._frm_conv.grid_remove()
+        self._frm_setup.grid(row=0, column=0, sticky="nsew")
+        for src, iid in self._tree_items.items():
+            old_vals = self._conv_tree.item(iid, "values")
+            filename = old_vals[0] if old_vals else src.name
+            self._conv_tree.item(iid, values=(filename, "Waiting", ""), tags=("waiting",))
 
 
 # ---------------------------------------------------------------------------

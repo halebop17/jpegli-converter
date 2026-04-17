@@ -70,7 +70,7 @@ Or from the terminal:
 |---|---|
 | **Mode** | `Single File`, `Single Folder`, or `All Subfolders`. |
 | **Input** | In `Single File` mode, choose one source file. In folder modes, choose a folder. |
-| **Output folder** | Used in `Single Folder` mode and in recursive mirror mode. |
+| **Output folder** | In `Single Folder` mode, defaults to `/converted/` in the source folder. In `All Subfolders` mode, defaults to `/converted/` inside each source folder. |
 | **Mirror folder structure to output folder** | Only for `All Subfolders` mode. Recreates the full input folder tree inside the selected output folder. |
 | **Export format** | `JPEG` or `JXL`. The selected format controls accepted source types and output extension. |
 | **JXL Encode Effort** | Only shown for `JXL` export. Range 1–9: lower is faster, higher gives better compression. |
