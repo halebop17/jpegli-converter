@@ -17,4 +17,4 @@ rm -rf build dist
 
 echo
 echo "Built app bundle:"
-echo "  $ROOT_DIR/dist/TIFF to jpegli Converter.app"
+echo "  $ROOT_DIR/dist/JPG Master - JPEGLI & JXL Converter.app"

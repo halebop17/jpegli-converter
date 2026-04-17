@@ -456,7 +456,7 @@ def convert_jxl_to_jpeg(src: Path, dst: Path, djxl: str) -> None:
 class ConverterApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("TIFF → jpegli Converter")
+        self.title("JPG Master - JPEGLI & JXL Converter")
         self.resizable(False, False)
 
         self.cjpegli = find_cjpegli()

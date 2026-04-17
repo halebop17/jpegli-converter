@@ -39,7 +39,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='TIFF to jpegli Converter',
+    name='JPG Master - JPEGLI & JXL Converter',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -60,17 +60,17 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='TIFF to jpegli Converter',
+    name='JPG Master - JPEGLI & JXL Converter',
 )
 
 app = BUNDLE(
     coll,
-    name='TIFF to jpegli Converter.app',
+    name='JPG Master - JPEGLI & JXL Converter.app',
     icon=None,
     bundle_identifier='com.halebop17.jpegli-converter',
     info_plist={
-        'CFBundleName': 'TIFF to jpegli Converter',
-        'CFBundleDisplayName': 'TIFF to jpegli Converter',
+        'CFBundleName': 'JPG Master - JPEGLI & JXL Converter',
+        'CFBundleDisplayName': 'JPG Master - JPEGLI & JXL Converter',
         'CFBundleShortVersionString': '1.0.0',
         'CFBundleVersion': '1.0.0',
         'NSHighResolutionCapable': 'True',

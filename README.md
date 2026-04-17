@@ -1,6 +1,8 @@
-# TIFF → jpegli Converter
+# JPG Master - JPEGLI & JXL Converter
 
-A macOS desktop app that converts TIFF files to high-quality JPEG using Google's [jpegli](https://github.com/google/jpegli) encoder.
+A macOS desktop app that converts TIFF and JPEG sources to high-quality JPEG or JPEG XL.
+
+Built around Google's [jpegli](https://github.com/google/jpegli) encoder and JPEG XL tooling, the app supports TIFF→JPEG, TIFF→JXL, JPEG→JXL lossless transcode, and JXL→JPEG round-trip reconstruction. That JPEG→JXL lossless path is a special workflow not found in most converters, because it preserves JPEG data exactly while migrating it into the JXL container.
 
 jpegli is currently one of the strongest JPEG encoders available for real-world photo export workflows because it improves quality-per-byte while remaining 100% baseline JPEG compatible. In practice, compared with older libjpeg-style encoders used in many photo apps and pipelines, jpegli typically delivers:
 
@@ -52,7 +54,7 @@ python3 -m venv .venv
 
 ## Running the app
 
-**Double-click** `TIFF Converter.app` in the project folder.
+**Double-click** `JPG Master - JPEGLI & JXL Converter.app` in the project folder.
 
 Or from the terminal:
 
