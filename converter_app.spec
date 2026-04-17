@@ -1,16 +1,27 @@
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 project_root = Path(SPECPATH)
 
 block_cipher = None
 
+imagecodecs_datas, imagecodecs_binaries, imagecodecs_hiddenimports = collect_all('imagecodecs')
+tifffile_datas, tifffile_binaries, tifffile_hiddenimports = collect_all('tifffile')
+
 
 a = Analysis(
     ['converter_app.py'],
     pathex=[str(project_root)],
-    binaries=[(str(project_root / 'bin' / 'cjpegli'), 'bin')],
-    datas=[],
-    hiddenimports=['imagecodecs', 'tifffile'],
+    binaries=[
+        (str(project_root / 'bin' / 'cjpegli'),                    'bin'),
+        (str(project_root / 'bin' / 'libjxl_threads.0.12.dylib'),  'bin'),
+        (str(project_root / 'bin' / 'libjxl_cms.0.12.dylib'),      'bin'),
+        (str(project_root / 'bin' / 'libjpeg.8.dylib'),            'bin'),
+        (str(project_root / 'bin' / 'liblcms2.2.dylib'),           'bin'),
+        (str(project_root / 'bin' / 'libhwy.1.dylib'),             'bin'),
+    ] + imagecodecs_binaries + tifffile_binaries,
+    datas=imagecodecs_datas + tifffile_datas,
+    hiddenimports=imagecodecs_hiddenimports + tifffile_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

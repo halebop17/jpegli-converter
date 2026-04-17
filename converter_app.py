@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import concurrent.futures
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -25,6 +26,8 @@ import tifffile
 from PIL import Image
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
+JPEG_SUFFIXES = {".jpg", ".jpeg"}
+JXL_SUFFIXES  = {".jxl"}
 
 RESIZE_MODES = [
     ("long_edge",  "Long Edge"),
@@ -72,6 +75,32 @@ def find_exiftool() -> str | None:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     return shutil.which("exiftool")
+
+
+CJXL_CANDIDATES = [
+    "/opt/homebrew/bin/cjxl",
+    "/usr/local/bin/cjxl",
+]
+
+
+def find_cjxl() -> str | None:
+    for path in CJXL_CANDIDATES:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("cjxl")
+
+
+DJXL_CANDIDATES = [
+    "/opt/homebrew/bin/djxl",
+    "/usr/local/bin/djxl",
+]
+
+
+def find_djxl() -> str | None:
+    for path in DJXL_CANDIDATES:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("djxl")
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +312,143 @@ def convert_tiff(src: Path, dst: Path, quality: int, cjpegli: str,
                 os.unlink(icc_tmp_path)
 
 
+def convert_to_jxl(
+    src: Path, dst: Path,
+    quality: int, effort: int,
+    cjxl: str,
+    exiftool: str | None = None,
+    strip_metadata: bool = False,
+    resize_enabled: bool = False,
+    resize_mode: str = "long_edge",
+    resize_value: int = 3000,
+    resize_w: int = 3000,
+    resize_h: int = 2000,
+) -> None:
+    """
+    Convert a single TIFF to JPEG XL via cjxl, preserving all metadata.
+
+    Pipeline:
+      1. tifffile reads TIFF → numpy array (uint8 or uint16, bit depth preserved)
+      2. normalize shape to (H, W, 3); alpha-composite RGBA at native depth
+      3. optional resize via Pillow (round-trip through PIL Image)
+      4. write temp PNG at native bit depth (imagecodecs for 16-bit, Pillow for 8-bit)
+      5. cjxl reads PNG → JXL  (--container=1 required for exiftool to write metadata)
+      6. exiftool copies EXIF/IPTC/XMP from original TIFF → output JXL
+      7. exiftool embeds ICC profile extracted from original TIFF
+
+    When the source is a JPEG file, a lossless transcode path is used instead:
+      cjxl input.jpg output.jxl --lossless_jpeg=1 --container=1
+    The JPEG bitstream and all its metadata are preserved bit-for-bit.
+    """
+    # ── JPEG lossless transcode (no intermediate PNG, no re-encode) ──
+    if src.suffix.lower() in JPEG_SUFFIXES:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [
+                cjxl, str(src), str(dst),
+                "--lossless_jpeg=1",
+                "--container=1",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "cjxl failed")
+        return
+    icc_profile = _extract_icc(src)
+
+    try:
+        arr, is_16bit = _read_tiff_array(src)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read TIFF: {exc}") from exc
+
+    arr = _normalize_array(arr)
+
+    if resize_enabled:
+        if arr.dtype == np.uint16:
+            arr8 = (arr >> 8).astype(np.uint8)
+            img_pil = Image.fromarray(arr8, mode="RGB")
+        else:
+            img_pil = Image.fromarray(arr, mode="RGB")
+        img_pil = apply_resize(img_pil, resize_mode, resize_value, resize_w, resize_h)
+        resized8 = np.array(img_pil)
+        if arr.dtype == np.uint16 and resized8.shape[:2] != arr.shape[:2]:
+            arr = (resized8.astype(np.uint16) << 8)
+        elif arr.dtype == np.uint8:
+            arr = resized8
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        _write_png_temp(arr, tmp_path)
+
+        result = subprocess.run(
+            [
+                cjxl, tmp_path, str(dst),
+                f"--quality={quality}",
+                f"--effort={effort}",
+                "--container=1",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "cjxl failed")
+    finally:
+        os.unlink(tmp_path)
+
+    if not strip_metadata and exiftool and dst.exists():
+        subprocess.run(
+            [
+                exiftool,
+                "-TagsFromFile", str(src),
+                "-EXIF:all", "-IPTC:all", "-XMP:all",
+                "-overwrite_original",
+                "-quiet",
+                str(dst),
+            ],
+            capture_output=True,
+        )
+
+        if icc_profile:
+            with tempfile.NamedTemporaryFile(suffix=".icc", delete=False) as icc_tmp:
+                icc_tmp.write(icc_profile)
+                icc_tmp_path = icc_tmp.name
+            try:
+                subprocess.run(
+                    [
+                        exiftool,
+                        f"-ICC_Profile<={icc_tmp_path}",
+                        "-overwrite_original",
+                        "-quiet",
+                        str(dst),
+                    ],
+                    capture_output=True,
+                )
+            finally:
+                os.unlink(icc_tmp_path)
+
+
+def convert_jxl_to_jpeg(src: Path, dst: Path, djxl: str) -> None:
+    """
+    Reconstruct original JPEG from a JPEG XL file using djxl.
+    Requires the JXL to have been created from a JPEG source with
+    lossless reconstruction data (--lossless_jpeg=1, the default for JPEG input).
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [djxl, str(src), str(dst)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "djxl failed")
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -294,8 +460,15 @@ class ConverterApp(tk.Tk):
         self.resizable(False, False)
 
         self.cjpegli = find_cjpegli()
+        self.cjxl = find_cjxl()
+        self.djxl = find_djxl()
         self.exiftool = find_exiftool()
         self._mode = tk.StringVar(value="folder")
+        self._export_format = tk.StringVar(value="jpeg")
+        self._input_hint_var = tk.StringVar(
+            value="Input: TIFF or JXL  →  JPEG (round-trip reconstruct for JXL)"
+        )
+        self._jxl_effort = tk.IntVar(value=7)
         self._mirror_tree = tk.BooleanVar(value=False)
         self._strip_metadata = tk.BooleanVar(value=False)
         self._resize_enabled = tk.BooleanVar(value=False)
@@ -308,9 +481,11 @@ class ConverterApp(tk.Tk):
         self._input_dir: Path | None = None
         self._output_dir: Path | None = None
         self._tiff_files: list[Path] = []
+        self._worker_count = tk.IntVar(value=2)
         self._running = False
 
         self._build_ui()
+        self._on_format_change()
         self._check_binary()
 
     # ------------------------------------------------------------------
@@ -374,8 +549,47 @@ class ConverterApp(tk.Tk):
                            command=self._update_quality_label)
         slider.grid(row=0, column=0, padx=10, pady=(6, 2))
 
-        self._q_label = ttk.Label(self._frm_q, text=self._quality_label_text(), width=32)
+        self._q_label = ttk.Label(self._frm_q, text=self._quality_label_text(), width=44)
         self._q_label.grid(row=1, column=0, padx=10, pady=(0, 6))
+
+        # ── Export format ─────────────────────────────────────────────
+        self._frm_format = ttk.LabelFrame(self, text="Export format")
+
+        ttk.Radiobutton(
+            self._frm_format,
+            text="JPEG",
+            value="jpeg",
+            variable=self._export_format,
+            command=self._on_format_change,
+        ).grid(row=0, column=0, padx=(8, 6), pady=6)
+        ttk.Radiobutton(
+            self._frm_format,
+            text="JXL",
+            value="jxl",
+            variable=self._export_format,
+            command=self._on_format_change,
+        ).grid(row=0, column=1, padx=6, pady=6)
+
+        self._input_hint_lbl = ttk.Label(
+            self._frm_format, textvariable=self._input_hint_var,
+            foreground="gray",
+        )
+        self._input_hint_lbl.grid(row=1, column=0, columnspan=2, padx=8, pady=(0, 6), sticky="w")
+
+        # ── JXL Encode Effort ─────────────────────────────────────────
+        self._frm_effort = ttk.LabelFrame(self, text="JXL Encode Effort")
+
+        effort_slider = ttk.Scale(
+            self._frm_effort, from_=1, to=9, orient="horizontal",
+            variable=self._jxl_effort, length=340,
+            command=self._update_effort_label,
+        )
+        effort_slider.grid(row=0, column=0, padx=10, pady=(6, 2))
+
+        self._effort_label = ttk.Label(
+            self._frm_effort, text=self._effort_label_text(), width=52,
+        )
+        self._effort_label.grid(row=1, column=0, padx=10, pady=(0, 6))
 
         # ── Folder structure options ─────────────────────────────────
         self._frm_structure = ttk.LabelFrame(self, text="Folder structure")
@@ -476,6 +690,17 @@ class ConverterApp(tk.Tk):
         ttk.Label(self._frm_meta, textvariable=self._meta_var,
                   foreground="gray").grid(row=0, column=0)
 
+        # ── Parallel conversions ──────────────────────────────────────
+        self._frm_workers = ttk.LabelFrame(self, text="Parallel conversions")
+
+        for value, label in [(1, "1  (sequential)"), (2, "2  (recommended)"), (4, "4  (fast)"), (6, "6  (fastest)")]:
+            ttk.Radiobutton(
+                self._frm_workers,
+                text=label,
+                value=value,
+                variable=self._worker_count,
+            ).grid(row=0, column=value - 1, padx=(8 if value == 1 else 6, 6), pady=6)
+
         # ── Convert button ────────────────────────────────────────────
         self._convert_btn = ttk.Button(self, text="Convert",
                                        command=self._start_conversion)
@@ -499,8 +724,17 @@ class ConverterApp(tk.Tk):
             self._frm_out.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
             row += 1
 
+        self._frm_format.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+        row += 1
+
         self._frm_q.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
         row += 1
+
+        if self._export_format.get() == "jxl":
+            self._frm_effort.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
+            row += 1
+        else:
+            self._frm_effort.grid_remove()
 
         if mode == "tree":
             self._frm_structure.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
@@ -521,6 +755,9 @@ class ConverterApp(tk.Tk):
         row += 1
 
         self._frm_meta.grid(row=row, column=0, sticky="w", padx=PAD_X, pady=(0, 4))
+        row += 1
+
+        self._frm_workers.grid(row=row, column=0, sticky="ew", padx=PAD_X, pady=4)
         row += 1
 
         self._convert_btn.grid(row=row, column=0, pady=(4, 14))
@@ -589,21 +826,31 @@ class ConverterApp(tk.Tk):
 
     def _on_mode_change(self):
         mode = self._mode.get()
+        fmt = self._export_format.get()
+
+        if fmt == "jxl":
+            folder_label = "Input folder (TIFF + JPEG files)"
+            tree_label   = "Input root folder (recursive TIFF + JPEG scan)"
+            file_label   = "Input TIFF or JPEG file"
+        else:
+            folder_label = "Input folder (TIFF + JXL files)"
+            tree_label   = "Input root folder (recursive TIFF + JXL scan)"
+            file_label   = "Input TIFF or JXL file"
 
         if mode == "file":
-            self._frm_in.config(text="Input TIFF file")
+            self._frm_in.config(text=file_label)
             self._in_var.set(str(self._input_file) if self._input_file else "(no file selected)")
             self._mirror_tree.set(False)
             if self._output_dir is None:
                 self._out_var.set("(same as input / converted)")
         elif mode == "folder":
-            self._frm_in.config(text="Input folder (TIFF files)")
+            self._frm_in.config(text=folder_label)
             self._in_var.set(str(self._input_dir) if self._input_dir else "(no folder selected)")
             self._mirror_tree.set(False)
             if self._output_dir is None:
                 self._out_var.set("(same as input / converted)")
         else:
-            self._frm_in.config(text="Input root folder (recursive TIFF scan)")
+            self._frm_in.config(text=tree_label)
             self._in_var.set(str(self._input_dir) if self._input_dir else "(no folder selected)")
             if self._output_dir is None:
                 self._out_var.set("(same as input folders in /converted)")
@@ -612,10 +859,24 @@ class ConverterApp(tk.Tk):
         self._scan_files()
 
     def _pick_input(self):
+        fmt = self._export_format.get()
+        if fmt == "jxl":
+            filetypes = [
+                ("TIFF / JPEG files", "*.tif *.tiff *.jpg *.jpeg"),
+                ("All files", "*"),
+            ]
+            file_title = "Select a TIFF or JPEG file"
+        else:
+            filetypes = [
+                ("TIFF / JXL files", "*.tif *.tiff *.jxl"),
+                ("All files", "*"),
+            ]
+            file_title = "Select a TIFF or JXL file"
+
         if self._mode.get() == "file":
             file_path = filedialog.askopenfilename(
-                title="Select a TIFF file",
-                filetypes=[("TIFF files", "*.tif *.tiff"), ("All files", "*")],
+                title=file_title,
+                filetypes=filetypes,
             )
             if not file_path:
                 return
@@ -649,6 +910,12 @@ class ConverterApp(tk.Tk):
 
     def _scan_files(self):
         mode = self._mode.get()
+        fmt = self._export_format.get()
+
+        if fmt == "jxl":
+            accepted = TIFF_SUFFIXES | JPEG_SUFFIXES
+        else:
+            accepted = TIFF_SUFFIXES | JXL_SUFFIXES
 
         if mode == "file":
             files = [self._input_file] if self._input_file and self._input_file.exists() else []
@@ -658,7 +925,7 @@ class ConverterApp(tk.Tk):
             else:
                 files = sorted(
                     p for p in self._input_dir.iterdir()
-                    if p.is_file() and p.suffix.lower() in TIFF_SUFFIXES
+                    if p.is_file() and p.suffix.lower() in accepted
                 )
         else:
             if not self._input_dir:
@@ -666,7 +933,7 @@ class ConverterApp(tk.Tk):
             else:
                 files = sorted(
                     p for p in self._input_dir.rglob("*")
-                    if p.is_file() and p.suffix.lower() in TIFF_SUFFIXES
+                    if p.is_file() and p.suffix.lower() in accepted
                 )
 
         self._tiff_files = files
@@ -678,41 +945,92 @@ class ConverterApp(tk.Tk):
                 self._listbox.insert(tk.END, f.name)
         n = len(files)
         self._count_label.config(
-            text=f"{n} TIFF file{'s' if n != 1 else ''} found."
+            text=f"{n} file{'s' if n != 1 else ''} found."
         )
 
     def _compute_output_path(self, src: Path) -> Path:
+        ext = ".jxl" if self._export_format.get() == "jxl" else ".jpg"
         mode = self._mode.get()
 
         if mode == "file":
-            return src.parent / (src.stem + ".jpg")
+            return src.parent / (src.stem + ext)
 
         if mode == "folder":
             if not self._output_dir:
                 raise RuntimeError("Output folder not set")
-            return self._output_dir / (src.stem + ".jpg")
+            return self._output_dir / (src.stem + ext)
 
         if self._mirror_tree.get():
             if not self._output_dir or not self._input_dir:
                 raise RuntimeError("Output or input folder not set")
             rel_parent = src.relative_to(self._input_dir).parent
-            return self._output_dir / rel_parent / (src.stem + ".jpg")
+            return self._output_dir / rel_parent / (src.stem + ext)
 
-        return src.parent / "converted" / (src.stem + ".jpg")
+        return src.parent / "converted" / (src.stem + ext)
 
     def _update_quality_label(self, _=None):
         self._q_label.config(text=self._quality_label_text())
 
     def _quality_label_text(self) -> str:
         q = int(self._quality.get())
-        labels = {
-            range(90, 101): "Maximum quality",
-            range(70, 90):  "High quality",
-            range(40, 70):  "Balanced",
-            range(1, 40):   "Smaller files",
-        }
-        desc = next((v for k, v in labels.items() if q in k), "")
+        if self._export_format.get() == "jxl":
+            if q == 100:
+                desc = "Lossless (exact pixel reproduction)"
+            elif q >= 90:
+                desc = "Visually lossless"
+            elif q >= 75:
+                desc = "High quality"
+            elif q >= 68:
+                desc = "Good quality (recommended range)"
+            else:
+                desc = "Compressed"
+        else:
+            labels = {
+                range(90, 101): "Maximum quality",
+                range(70, 90):  "High quality",
+                range(40, 70):  "Balanced",
+                range(1, 40):   "Smaller files",
+            }
+            desc = next((v for k, v in labels.items() if q in k), "")
         return f"Quality: {q} / 100  —  {desc}"
+
+    def _effort_label_text(self) -> str:
+        e = int(self._jxl_effort.get())
+        names = {
+            1: "lightning", 2: "thunder", 3: "falcon", 4: "cheetah",
+            5: "hare", 6: "wombat", 7: "squirrel", 8: "kitten", 9: "tortoise",
+        }
+        name = names.get(e, str(e))
+        if e < 7:
+            hint = "  (faster encode)"
+        elif e == 7:
+            hint = "  (default; recommended)"
+        else:
+            hint = "  (slower, better compression)"
+        return f"Effort: {e} / 9  —  {name}{hint}"
+
+    def _update_effort_label(self, _=None):
+        self._effort_label.config(text=self._effort_label_text())
+
+    def _on_format_change(self):
+        fmt = self._export_format.get()
+        if fmt == "jxl":
+            self._quality.set(90)
+            self._input_hint_var.set("Input: TIFF or JPEG  →  JXL (lossless transcode for JPEG)")
+            if self.cjxl:
+                self._convert_btn.state(["!disabled"])
+            else:
+                self._convert_btn.state(["disabled"])
+        else:
+            self._quality.set(85)
+            self._input_hint_var.set("Input: TIFF or JXL  →  JPEG (round-trip reconstruct for JXL)")
+            if self.cjpegli:
+                self._convert_btn.state(["!disabled"])
+            else:
+                self._convert_btn.state(["disabled"])
+        self._update_quality_label()
+        self._apply_mode_layout()
+        self._scan_files()
 
     def _parse_resize_params(self) -> tuple[bool, str, int, int, int]:
         """Validate and return (enabled, mode, value, w, h). Raises ValueError on bad input."""
@@ -740,7 +1058,7 @@ class ConverterApp(tk.Tk):
         if self._running:
             return
         if not self._tiff_files:
-            messagebox.showwarning("No files", "No TIFF files found for the selected mode.")
+            messagebox.showwarning("No files", "No files found for the selected mode.")
             return
 
         mode = self._mode.get()
@@ -751,6 +1069,34 @@ class ConverterApp(tk.Tk):
             messagebox.showwarning("No output", "Please choose an output folder for mirrored output.")
             return
 
+        fmt = self._export_format.get()
+        if fmt == "jxl" and not self.cjxl:
+            messagebox.showerror(
+                "cjxl not found",
+                "cjxl was not found.\n\n"
+                "Install it with:\n"
+                "  brew install jpeg-xl",
+            )
+            return
+        if fmt == "jpeg" and not self.cjpegli:
+            messagebox.showerror(
+                "cjpegli not found",
+                "cjpegli is required for JPEG export but was not found.",
+            )
+            return
+        if fmt == "jpeg" and not self.djxl:
+            has_jxl_input = any(
+                f.suffix.lower() in JXL_SUFFIXES for f in self._tiff_files
+            )
+            if has_jxl_input:
+                messagebox.showerror(
+                    "djxl not found",
+                    "djxl is required to reconstruct JPEG from JXL files but was not found.\n\n"
+                    "Install it with:\n"
+                    "  brew install jpeg-xl",
+                )
+                return
+
         try:
             self._parse_resize_params()
         except ValueError as exc:
@@ -759,38 +1105,77 @@ class ConverterApp(tk.Tk):
 
         self._running = True
         self._convert_btn.state(["disabled"])
+        for child in self._frm_workers.winfo_children():
+            child.state(["disabled"])
         threading.Thread(target=self._run_conversion, daemon=True).start()
+
+    def _convert_one(self, src: Path, fmt: str, quality: int, effort: int,
+                      strip_metadata: bool, resize_enabled: bool,
+                      resize_mode: str, resize_value: int,
+                      resize_w: int, resize_h: int) -> None:
+        """Convert a single file. Runs inside a worker thread."""
+        dst = self._compute_output_path(src)
+        src_ext = src.suffix.lower()
+        if fmt == "jxl":
+            convert_to_jxl(
+                src, dst, quality, effort, self.cjxl,
+                self.exiftool,
+                strip_metadata=strip_metadata,
+                resize_enabled=resize_enabled,
+                resize_mode=resize_mode,
+                resize_value=resize_value,
+                resize_w=resize_w,
+                resize_h=resize_h,
+            )
+        elif src_ext in JXL_SUFFIXES:
+            convert_jxl_to_jpeg(src, dst, self.djxl)
+        else:
+            convert_tiff(
+                src, dst, quality, self.cjpegli, self.exiftool,
+                strip_metadata=strip_metadata,
+                resize_enabled=resize_enabled,
+                resize_mode=resize_mode,
+                resize_value=resize_value,
+                resize_w=resize_w,
+                resize_h=resize_h,
+            )
 
     def _run_conversion(self):
         files = self._tiff_files
         total = len(files)
         quality = int(self._quality.get())
-        errors: list[str] = []
+        effort = int(self._jxl_effort.get())
+        fmt = self._export_format.get()
+        strip_metadata = self._strip_metadata.get()
+        workers = self._worker_count.get()
         resize_enabled, resize_mode, resize_value, resize_w, resize_h = self._parse_resize_params()
+        errors: list[str] = []
 
         self._set_progress(0, total)
+        self._update_status(f"0 / {total}")
 
-        for i, src in enumerate(files, start=1):
-            self._update_status(f"{i - 1} / {total}")
-            try:
-                dst = self._compute_output_path(src)
-                convert_tiff(
-                    src,
-                    dst,
-                    quality,
-                    self.cjpegli,
-                    self.exiftool,
-                    strip_metadata=self._strip_metadata.get(),
-                    resize_enabled=resize_enabled,
-                    resize_mode=resize_mode,
-                    resize_value=resize_value,
-                    resize_w=resize_w,
-                    resize_h=resize_h,
-                )
-            except Exception as exc:
-                errors.append(f"{src.name}: {exc}")
-            self._set_progress(i, total)
-            self._update_status(f"{i} / {total}")
+        lock = threading.Lock()
+        done_count = [0]  # mutable container for closure
+
+        def run_one(src: Path):
+            self._convert_one(
+                src, fmt, quality, effort, strip_metadata,
+                resize_enabled, resize_mode, resize_value, resize_w, resize_h,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_src = {pool.submit(run_one, src): src for src in files}
+            for future in concurrent.futures.as_completed(future_to_src):
+                src = future_to_src[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(f"{src.name}: {exc}")
+                with lock:
+                    done_count[0] += 1
+                    count = done_count[0]
+                self.after(0, lambda c=count: self._set_progress(c, total))
+                self.after(0, lambda c=count: self._update_status(f"{c} / {total}"))
 
         self._running = False
         self.after(0, self._on_done, total, errors)
@@ -804,6 +1189,8 @@ class ConverterApp(tk.Tk):
 
     def _on_done(self, total: int, errors: list[str]):
         self._convert_btn.state(["!disabled"])
+        for child in self._frm_workers.winfo_children():
+            child.state(["!disabled"])
         self._update_status("Done.")
 
         ok = total - len(errors)
